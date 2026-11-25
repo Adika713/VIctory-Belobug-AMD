@@ -4,6 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -637,6 +638,44 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
+
+    /// CPU-only A/B of taking the deferred-work lock on every access versus
+    /// the list-lifetime invariant used here. Run with
+    /// `cargo test --release -p victory-gpu deferred_access_without_lock -- --ignored --nocapture --test-threads=1`.
+    #[test]
+    #[ignore = "synthetic CPU release benchmark"]
+    fn deferred_access_without_lock() {
+        let Some(host) = host() else { return };
+        let Ok(list) = host.new_list() else { return };
+        let locked = Mutex::new(Deferred::default());
+        const CALLS: usize = 500_000;
+        let mut samples = Vec::new();
+        for sample in 0..5 {
+            let started = std::time::Instant::now();
+            for _ in 0..CALLS {
+                let deferred = locked.lock().unwrap_or_else(|e| e.into_inner());
+                std::hint::black_box(deferred.early);
+            }
+            let old = started.elapsed().as_secs_f64() * 1e9 / CALLS as f64;
+            let started = std::time::Instant::now();
+            for _ in 0..CALLS {
+                let deferred = list.deferred();
+                std::hint::black_box(deferred.early);
+            }
+            let new = started.elapsed().as_secs_f64() * 1e9 / CALLS as f64;
+            println!("sample {sample}: lock {old:.1} ns, direct {new:.1} ns");
+            samples.push((old, new));
+        }
+        let mut old: Vec<f64> = samples.iter().map(|s| s.0).collect();
+        let mut new: Vec<f64> = samples.iter().map(|s| s.1).collect();
+        old.sort_by(f64::total_cmp);
+        new.sort_by(f64::total_cmp);
+        println!(
+            "median: lock {:.1} ns, direct {:.1} ns",
+            old[old.len() / 2],
+            new[new.len() / 2]
+        );
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -644,8 +683,9 @@ pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
     pub(crate) depth_bounds: Option<ID3D12GraphicsCommandList1>,
-    /// Work for submission time, in recorded order.
-    deferred: Mutex<Deferred>,
+    /// Work for submission time, in recorded order. Recorded by the title on
+    /// one thread and read once the list is closed, so no lock is needed.
+    deferred: UnsafeCell<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
@@ -728,7 +768,8 @@ impl Drop for HostList {
 // SAFETY: D3D12 lists and allocators may be used from any thread, one at
 // a time: the title records a list on one thread at a time, and a
 // submission runs it after its recording ended (a reset while one is to
-// run moves recording to a new list). The rest is locked.
+// run moves recording to a new list). Deferred work follows the same rule;
+// the remaining shared fields are locked.
 unsafe impl Send for HostList {}
 // SAFETY: as above.
 unsafe impl Sync for HostList {}
@@ -1079,7 +1120,7 @@ impl Host {
                 allocator,
                 depth_bounds: self.depth_bounds_supported.then(|| list.cast()).transpose()?,
                 list,
-                deferred: Mutex::default(),
+                deferred: UnsafeCell::new(Deferred::default()),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
@@ -2215,8 +2256,11 @@ impl HostList {
         }
     }
 
-    fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
-        self.deferred.lock().unwrap_or_else(|e| e.into_inner())
+    fn deferred(&self) -> &mut Deferred {
+        // SAFETY: one thread records the list at a time; a submission reads
+        // it only after recording ended, and a reset moves recording to a new
+        // list (`crate::list`).
+        unsafe { &mut *self.deferred.get() }
     }
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.

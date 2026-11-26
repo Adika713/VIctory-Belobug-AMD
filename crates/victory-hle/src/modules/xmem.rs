@@ -444,12 +444,11 @@ impl Section {
             }
             let run_len = run * PAGE;
             let file_backed = self.backing.is_some();
-            if !commit(base + page * PAGE, run_len, file_backed) {
-                return None;
-            }
-            let lazy_partial = !file_backed && !on_wine() && lazy_physical_enabled() && run_len > LAZY_PREFIX;
-            let committed = if lazy_partial { LAZY_PREFIX / PAGE } else { run };
-            for p in page..page + committed {
+            let committed_pages = match commit(base + page * PAGE, run_len, file_backed) {
+                Some(n) => n,
+                None => return None,
+            };
+            for p in page..page + committed_pages {
                 self.committed[p / 64].fetch_or(1 << (p % 64), Ordering::AcqRel);
             }
             page += run;
@@ -475,11 +474,9 @@ impl Section {
             return true;
         }
         let file_backed = self.backing.is_some();
-        if !counted(Call::Commit, || commit(base, len, file_backed)) {
+        let Some(committed_pages) = counted(Call::Commit, || commit(base, len, file_backed)) else {
             return false;
-        }
-        let lazy_partial = !file_backed && !on_wine() && lazy_physical_enabled() && len > LAZY_PREFIX;
-        let committed_pages = if lazy_partial { LAZY_PREFIX / PAGE } else { pages.len() };
+        };
         for (i, p) in pages.enumerate() {
             if i >= committed_pages { break; }
             let (word, bit) = bit(p);
@@ -823,7 +820,7 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        if !commit(at.Value as usize, len, slice.section.backing.is_some()) {
+        if commit(at.Value as usize, len, slice.section.backing.is_some()).is_none() {
             tracing::warn!(error = %std::io::Error::last_os_error(), n, "physical pages not committed for a write");
             return None;
         }
@@ -1880,13 +1877,40 @@ unsafe extern "system" fn commit_on_demand(info: *mut ExceptionPointers) -> i32 
 }
 
 fn lazy_has(page: usize) -> bool {
-    let Ok(ranges) = LAZY.try_lock() else { return false; };
+    let ranges = LAZY.lock().unwrap_or_else(|e| e.into_inner());
     ranges.range(..=page).next_back().is_some_and(|(start, end)| *start <= page && page < *end)
 }
 
 fn commit_fault_page(page: usize) -> bool {
     // SAFETY: page is inside a registered reserved mapping view.
     !unsafe { VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null()
+}
+
+/// Ensures lazy physical pages in `[base, base+len)` are committed.
+/// Kernel-mode writes (ReadFile, DirectStorage) do not trigger the user-mode VEH.
+pub(crate) fn ensure_lazy_committed(base: usize, len: usize) {
+    if len == 0 || !lazy_physical_enabled() { return; }
+    let start = base & !(PAGE - 1);
+    let end = base.saturating_add(len);
+    let mut page = start;
+    while page < end {
+        let needs = {
+            let ranges = LAZY.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((&rstart, &rend)) = ranges.range(..=page).next_back().filter(|(s, e)| **s <= page && page < **e) {
+                Some(rend.min(end))
+            } else if let Some((&rstart, &rend)) = ranges.range(page + 1..end).next() {
+                page = rstart;
+                Some(rend.min(end))
+            } else {
+                None
+            }
+        };
+        let Some(rend) = needs else { break; };
+        while page < rend {
+            let _ = commit_fault_page(page);
+            page += PAGE;
+        }
+    }
 }
 
 fn register_lazy(base: usize, len: usize) -> bool {
@@ -1917,34 +1941,36 @@ fn lazy_remove(base: usize, len: usize) {
 }
 
 /// Commits the section pages a view shows (once per page, whichever view).
-fn commit(base: usize, len: usize, file_backed: bool) -> bool {
+/// Returns committed page count on success.
+fn commit(base: usize, len: usize, file_backed: bool) -> Option<usize> {
+    let pages = len / PAGE;
     if file_backed || on_wine() {
-        return true; // file-backed/whole-committed section
+        return Some(pages); // file-backed/whole-committed section
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
-        return true;
+        return Some(pages);
     }
     let error = std::io::Error::last_os_error();
     if error.raw_os_error() != Some(ERROR_COMMITMENT_LIMIT as i32) {
         tracing::warn!(len, %error, "committing physical pages failed");
-        return false;
+        return None;
     }
     if !lazy_physical_enabled() {
         commit_refused(len, "physical pages", error);
-        return false;
+        return None;
     }
     let prefix = len.min(LAZY_PREFIX);
     if prefix > 0 && unsafe { VirtualAlloc(base as *const c_void, prefix, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
         commit_refused(len, "physical pages", std::io::Error::last_os_error());
-        return false;
+        return None;
     }
     if !register_lazy(base, len) {
         commit_refused(len, "physical pages", std::io::Error::last_os_error());
-        return false;
+        return None;
     }
     tracing::warn!(len, prefix, "VICTORY_LAZY_PHYSICAL=1: committed prefix and deferred remaining physical pages");
-    true
+    Some(prefix / PAGE)
 }
 
 /// Reports memory the host would not give: at the Windows commit limit to

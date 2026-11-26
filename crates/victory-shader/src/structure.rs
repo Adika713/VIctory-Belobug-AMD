@@ -194,6 +194,9 @@ impl Bools {
     }
 
     fn ite(&mut self, f: Bool, g: Bool, h: Bool) -> Bool {
+        if self.overflow {
+            return Bool::FALSE;
+        }
         if f == Bool::TRUE || g == h {
             return g;
         }
@@ -206,11 +209,18 @@ impl Bools {
         if let Some(&r) = self.memo.get(&(f, g, h)) {
             return r;
         }
+        if self.memo.len() >= MAX_NODES {
+            self.overflow = true;
+            return Bool::FALSE;
+        }
         let top = |b: Bool| self.nodes[b.0 as usize].0;
         let v = top(f).min(top(g)).min(top(h));
         let ((f0, f1), (g0, g1), (h0, h1)) = (self.split(f, v), self.split(g, v), self.split(h, v));
         let lo = self.ite(f0, g0, h0);
         let hi = self.ite(f1, g1, h1);
+        if self.overflow {
+            return Bool::FALSE;
+        }
         let r = self.mk(v, lo, hi);
         self.memo.insert((f, g, h), r);
         r

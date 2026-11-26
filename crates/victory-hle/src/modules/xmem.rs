@@ -1933,15 +1933,13 @@ pub(crate) fn ensure_lazy_committed(base: usize, len: usize) {
             }
         };
         let Some((rstart, rend)) = range else { break };
-        let mut p = rstart;
-        while p < rend {
-            let _ = commit_fault_page(p);
-            p += PAGE;
-        }
+        let len = rend.saturating_sub(rstart);
+        // SAFETY: range is inside a registered lazy reserved mapping view.
+        unsafe { VirtualAlloc(rstart as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) };
         // Remove committed pages from lazy tracking to avoid repeated VEH work.
         // Bitmaps in Section are not updated here; later commit/window paths
         // self-heal because VirtualAlloc(MEM_COMMIT) is idempotent.
-        lazy_remove(rstart, rend.saturating_sub(rstart));
+        lazy_remove(rstart, len);
         page = rend;
     }
 }

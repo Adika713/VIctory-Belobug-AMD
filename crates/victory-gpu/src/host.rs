@@ -534,6 +534,10 @@ pub(crate) static RETIRED_STATS: [std::sync::atomic::AtomicU64; 3] =
 /// deferred command-list state and their bytes. Updated on hold/drop/reset.
 pub(crate) static DEFERRED_UPLOAD_STATS: [std::sync::atomic::AtomicU64; 2] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// Deferred kept-object attribution (report-only): host objects kept alive by
+/// live deferred command-list state (pipelines, roots, heaps, indirect args).
+pub(crate) static DEFERRED_KEPT_STATS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// What the layer did to the host's objects lately, newest last (sweeps
 /// that let host copies go, pipeline library calls, saves and trims): said
@@ -2304,10 +2308,12 @@ impl Drop for Deferred {
     fn drop(&mut self) {
         let count = self.uploads.len() as u64;
         let bytes = self.upload_bytes;
+        let kept = self.kept.len() as u64;
         ALIVE[6].fetch_sub(count, Ordering::Relaxed);
         ALIVE[7].fetch_sub(bytes, Ordering::Relaxed);
         DEFERRED_UPLOAD_STATS[0].fetch_sub(count, Ordering::Relaxed);
         DEFERRED_UPLOAD_STATS[1].fetch_sub(bytes, Ordering::Relaxed);
+        DEFERRED_KEPT_STATS.fetch_sub(kept, Ordering::Relaxed);
     }
 }
 
@@ -6708,6 +6714,7 @@ impl HostList {
             }
             deferred.kept.push(pso.clone().into());
             deferred.kept.push(root.clone().into());
+            DEFERRED_KEPT_STATS.fetch_add(2, Ordering::Relaxed);
         }
         self.used_pipeline(name);
     }
@@ -7123,6 +7130,7 @@ impl HostList {
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
+            DEFERRED_KEPT_STATS.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -10387,6 +10395,9 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(None), 10_000);
     }
 }
+
+
+
 
 
 

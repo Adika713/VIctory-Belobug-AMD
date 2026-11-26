@@ -1916,7 +1916,7 @@ pub(crate) fn ensure_lazy_committed(base: usize, len: usize) {
     while page < end {
         let range = {
             let ranges = LAZY.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((&rstart, &rend)) = ranges
+            if let Some((&_rstart, &rend)) = ranges
                 .range(..=page)
                 .next_back()
                 .filter(|(s, e)| **s <= page && page < **e)

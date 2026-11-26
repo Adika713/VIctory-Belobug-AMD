@@ -503,6 +503,7 @@ impl Drop for Section {
                     Value: base as *mut c_void,
                 })
             };
+            lazy_remove(base, self.pages * PAGE);
         }
         victory_gpu::title_memory_section_gone(self.handle as usize);
         // SAFETY: our handle; views keep the section alive on their own.
@@ -856,8 +857,10 @@ impl View {
 impl Drop for View {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+        let base = self.at.Value as usize;
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(self.at) };
+        lazy_remove(base, self.len);
     }
 }
 
@@ -1891,8 +1894,11 @@ unsafe extern "system" fn commit_on_demand(info: *mut ExceptionPointers) -> i32 
     if record.exception_code != STATUS_ACCESS_VIOLATION || record.number_parameters < 2 { return 0; }
     let page = record.exception_information[1] & !(PAGE - 1);
     if !lazy_has(page) { return 0; }
-    if !commit_fault_page(page) { return 0; }
-    EXCEPTION_CONTINUE_EXECUTION
+    match commit_fault_page(page) {
+        CommitFault::Committed => EXCEPTION_CONTINUE_EXECUTION,
+        CommitFault::NotLazy => 0,
+        CommitFault::Failed => 0,
+    }
 }
 
 fn lazy_has(page: usize) -> bool {
@@ -1903,9 +1909,39 @@ fn lazy_has(page: usize) -> bool {
     ranges.range(..=page).next_back().is_some_and(|(start, end)| *start <= page && page < *end)
 }
 
-fn commit_fault_page(page: usize) -> bool {
+enum CommitFault {
+    Committed,
+    NotLazy,
+    Failed,
+}
+
+fn commit_fault_page(page: usize) -> CommitFault {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEM_RESERVE, VirtualQuery};
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let queried = unsafe {
+        VirtualQuery(
+            page as *const c_void,
+            &mut info,
+            size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if queried == 0 {
+        return CommitFault::Failed;
+    }
+    // Only demand-commit still-reserved pages. Committed pages in a lazy
+    // range (including PAGE_GUARD pages owned by GPU watch) must go through
+    // their normal handler.
+    if info.State != MEM_RESERVE {
+        return CommitFault::NotLazy;
+    }
     // SAFETY: page is inside a registered reserved mapping view.
-    !unsafe { VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null()
+    let ok = !unsafe { VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null();
+    if ok {
+        lazy_remove(page, PAGE);
+        CommitFault::Committed
+    } else {
+        CommitFault::Failed
+    }
 }
 
 /// Ensures lazy physical pages in `[base, base+len)` are committed.
@@ -2030,11 +2066,12 @@ fn commit(base: usize, len: usize, file_backed: bool) -> Option<usize> {
         commit_refused(len, "physical pages", std::io::Error::last_os_error());
         return None;
     }
-    if !register_lazy(base, len) {
+    let deferred = len.saturating_sub(prefix);
+    if deferred > 0 && !register_lazy(base + prefix, deferred) {
         commit_refused(len, "physical pages", std::io::Error::last_os_error());
         return None;
     }
-    tracing::warn!(len, prefix, "VICTORY_LAZY_PHYSICAL=1: committed prefix and deferred remaining physical pages");
+    tracing::warn!(len, prefix, deferred, "VICTORY_LAZY_PHYSICAL=1: committed prefix and deferred remaining physical pages");
     Some(prefix / PAGE)
 }
 

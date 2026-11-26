@@ -1,4 +1,4 @@
-//! The host GPU: one D3D12 device and direct queue (decision 0007), and a
+﻿//! The host GPU: one D3D12 device and direct queue (decision 0007), and a
 //! window to present on.
 //!
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
@@ -1625,7 +1625,7 @@ impl Host {
         // Host timestamps the lists resolved, on the title's GPU clock.
         let mut clock = None;
         for list in runs {
-            let mut deferred = list.deferred();
+            let deferred = list.deferred();
             for &(at, what, bytes) in &deferred.writes[deferred.early..] {
                 let what = match what {
                     crate::queue::Written::HostTimestamp(raw) => match clock.get_or_insert_with(|| self.clock()) {
@@ -2265,7 +2265,7 @@ impl HostList {
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
-        let mut deferred = self.deferred();
+        let deferred = self.deferred();
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
@@ -2289,7 +2289,7 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        let mut deferred = self.deferred();
+        let deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
             deferred
@@ -2313,7 +2313,7 @@ impl HostList {
 
     /// A wait for a memory value.
     pub(crate) fn note_wait(&self, wait: crate::memwait::Wait) {
-        let mut deferred = self.deferred();
+        let deferred = self.deferred();
         let before = deferred.writes.len();
         deferred.waits.push((before, wait));
         let work = *self.work.lock().unwrap_or_else(|e| e.into_inner());
@@ -2325,7 +2325,7 @@ impl HostList {
     /// Work is draws, dispatches, clears and copies: what has to run first.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         let work = *self.work.lock().unwrap_or_else(|e| e.into_inner());
-        let mut deferred = self.deferred();
+        let deferred = self.deferred();
         deferred.writes.push((dst as usize, what, bytes));
         deferred.marks.push(work);
     }
@@ -2445,7 +2445,7 @@ impl HostList {
     /// Does the list's writes that come before its first wait not met, if no
     /// work of the list precedes them; whether there were any.
     pub(crate) fn write_early(&self) -> bool {
-        let mut deferred = self.deferred();
+        let deferred = self.deferred();
         let first = deferred.waits.iter().find(|(_, wait)| !wait.met(wait.value()));
         let Some(&(before, _)) = first else {
             return false;
@@ -2573,7 +2573,7 @@ impl HostList {
                 Some((b, d as usize))
             })
             .as_ref()?;
-        let mut deferred = self.deferred();
+        let deferred = self.deferred();
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
             let at = *data;
@@ -2629,7 +2629,7 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        let mut deferred = self.deferred();
+        let deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
         deferred.refreshed.clear();
     }
@@ -2642,7 +2642,7 @@ impl HostList {
         heap: &std::sync::Arc<crate::descriptor::host::HostHeap>,
         writes: bool,
     ) {
-        let mut deferred = self.deferred();
+        let deferred = self.deferred();
         match deferred
             .bindless
             .iter_mut()
@@ -4392,3 +4392,4 @@ fn wait_if_removed(device: &ID3D12Device, error: &windows::core::Error) {
     });
     std::thread::sleep(std::time::Duration::from_secs(20));
 }
+

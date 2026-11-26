@@ -1,4 +1,4 @@
-//! Texture contents the title writes itself (decision 0007, "Texture
+﻿//! Texture contents the title writes itself (decision 0007, "Texture
 //! memory"): streamed pages, layout-library copies, movie frames, glyph
 //! atlases. Such a texture lives in console memory in its tiled layout;
 //! before a submission samples its host copy, the memory is detiled into a
@@ -475,10 +475,8 @@ impl Drop for Staging {
     }
 }
 
-/// For the memory line: staging buffers alive, their bytes, and how many
-/// of them their texture still has (the others wait for a list's reset).
-#[cfg(feature = "diagnostics")]
-pub(crate) fn memory() -> [u64; 3] {
+/// Staging buffers alive, bytes, and kept-in-table count. Report-only.
+pub(crate) fn staging_stats() -> [u64; 3] {
     use std::sync::atomic::Ordering::Relaxed;
     let kept = STAGING
         .lock()
@@ -486,6 +484,13 @@ pub(crate) fn memory() -> [u64; 3] {
         .as_ref()
         .map_or(0, |map| map.len() as u64);
     [STAGED[0].load(Relaxed), STAGED[1].load(Relaxed), kept]
+}
+
+/// For the memory line: staging buffers alive, their bytes, and how many
+/// of them their texture still has (the others wait for a list's reset).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn memory() -> [u64; 3] {
+    staging_stats()
 }
 
 /// Staging buffers let go as idle since the start, and their bytes.
@@ -2199,3 +2204,4 @@ mod allocation_costs {
         }
     }
 }
+

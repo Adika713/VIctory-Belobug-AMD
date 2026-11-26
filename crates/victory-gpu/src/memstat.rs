@@ -39,7 +39,7 @@ pub fn report() -> String {
         #[cfg(feature = "diagnostics")]
         {
             let shadows = crate::shadow::memory();
-            let staged = crate::texture::memory();
+            let staged = crate::texture::staging_stats();
             let windows = crate::shadow::windows();
             let host_tex: Vec<u64> = crate::resource::HOST_TEXTURES.iter().map(|a| a.load(Relaxed)).collect();
             let placed = crate::resource::placed_textures();
@@ -100,6 +100,7 @@ mod tests {
         assert!(line.contains("deferred uploads"), "{line}");
     }
 }
+
 
 
 

@@ -1,4 +1,4 @@
-//! Command queues. Submitted lists run on the host GPU and are waited for,
+﻿//! Command queues. Submitted lists run on the host GPU and are waited for,
 //! so fence signals complete at once.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -1001,12 +1001,29 @@ struct Shown {
     resource: usize,
 }
 
+/// Diagnostics-only instant of the previous present, for per-frame intervals.
+#[cfg(feature = "diagnostics")]
+static LAST_PRESENT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
 /// Shows `texture`, in host state `state`, in our window.
 #[cfg(windows)]
 fn show(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32, what: Shown) {
     let Some(host) = crate::host::host() else {
         return;
     };
+    #[cfg(feature = "diagnostics")]
+    {
+        let now = std::time::Instant::now();
+        let mut last = LAST_PRESENT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(previous) = last.replace(now) {
+            tracing::debug!(
+                target: "victory_gpu::frame",
+                frame = what.frame,
+                interval_us = now.duration_since(previous).as_micros() as u64,
+                "frame interval"
+            );
+        }
+    }
     let shown = host.present(texture, state, what.frame);
     #[cfg(feature = "diagnostics")]
     blinks(what.frame, what.resource as This, state, shown);
@@ -1255,8 +1272,8 @@ mod tests {
     fn newer_queues_have_their_methods_two_slots_later() {
         let (old, new) = (queue_table(false), queue_table(true));
         assert_eq!(old[10], new[10]); // submission stays at 0x50
-        assert_eq!(old[14], new[16]); // signal 0x70 → 0x80
-        assert_eq!(old[30], new[32]); // present 0xf0 → 0x100
+        assert_eq!(old[14], new[16]); // signal 0x70 â†’ 0x80
+        assert_eq!(old[30], new[32]); // present 0xf0 â†’ 0x100
         assert_eq!(new[35], execute_x as *const ()); // 0x118
     }
 
@@ -1280,3 +1297,4 @@ mod tests {
         assert!(at[1] > first);
     }
 }
+

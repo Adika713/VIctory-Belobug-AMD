@@ -64,6 +64,19 @@ pub fn report() -> String {
                 mib(made.get(4).copied().unwrap_or(0)),
                 mib(made.get(5).copied().unwrap_or(0)),
             );
+            let tiles: Vec<u64> = crate::tiles::STATS.iter().map(|a| a.load(Relaxed)).collect();
+            if tiles.iter().any(|v| *v != 0) {
+                let _ = write!(
+                    line,
+                    "; tiles alive {} (levels {} MiB, given {} MiB, pool {} MiB, heap-fail {}, reupload {})",
+                    tiles.get(0).copied().unwrap_or(0),
+                    mib(tiles.get(1).copied().unwrap_or(0)),
+                    mib(tiles.get(2).copied().unwrap_or(0)),
+                    mib(tiles.get(3).copied().unwrap_or(0)),
+                    tiles.get(9).copied().unwrap_or(0),
+                    tiles.get(10).copied().unwrap_or(0),
+                );
+            }
             if let Some(h) = crate::host::host() {
                 if let Some([budget, used, shared_budget, shared_used]) = h.video_memory() {
                     let _ = write!(
@@ -105,6 +118,7 @@ mod tests {
         assert!(line.contains("kept "), "{line}");
     }
 }
+
 
 
 

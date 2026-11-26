@@ -10,6 +10,8 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
+use std::os::windows::io::AsRawHandle;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
@@ -350,8 +352,8 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-/// A section handle and its size.
-struct Section(HANDLE, usize);
+/// A section handle, its size, and the backing file when it is file-backed.
+struct Section(HANDLE, usize, Option<(std::fs::File, PathBuf)>);
 
 /// Bytes of the physical-page sections alive (reserved; committed as
 /// mapped or written).
@@ -367,7 +369,89 @@ impl Drop for Section {
         SECTION_BYTES.fetch_sub(self.1, Ordering::Relaxed);
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
+        if let Some((file, path)) = self.2.take() {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+        }
     }
+}
+
+/// Whether physical pages come from temporary files instead of the pagefile.
+/// Off by default; the low-memory launcher opts in with
+/// `VICTORY_FILE_PHYSICAL=1`.
+fn file_physical_enabled() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("VICTORY_FILE_PHYSICAL").is_some_and(|value| value == "1")
+    });
+    *ENABLED
+}
+
+/// Creates a file-backed section in `dir`. A file mapping's dirty pages are
+/// backed by that file, not by the host's pagefile, so a title touching a
+/// 6.1 GiB pool does not consume Windows commit charge.
+fn file_section_in(dir: &Path, size: usize) -> Option<(HANDLE, std::fs::File, PathBuf)> {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    std::fs::create_dir_all(dir).ok()?;
+    let name = format!(
+        "victory-physical-{}-{}.bin",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+    let path = dir.join(name);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .ok()?;
+    file.set_len(size as u64).ok()?;
+    // SAFETY: `file` stays open in the returned tuple for the mapping's life.
+    let handle = unsafe {
+        CreateFileMappingW(
+            file.as_raw_handle() as HANDLE,
+            std::ptr::null(),
+            PAGE_READWRITE,
+            (size as u64 >> 32) as u32,
+            size as u32,
+            std::ptr::null(),
+        )
+    };
+    if handle.is_null() {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return None;
+    }
+    Some((handle, file, path))
+}
+
+/// Creates the section behind one physical-page allocation, falling back to
+/// the pagefile-backed section if a backing file cannot be made.
+fn create_section(size: usize) -> Option<(HANDLE, Option<(std::fs::File, PathBuf)>)> {
+    if file_physical_enabled() {
+        let dir = std::env::var_os("VICTORY_CACHE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        if let Some((handle, file, path)) = file_section_in(&dir, size) {
+            return Some((handle, Some((file, path))));
+        }
+        tracing::warn!("file-backed physical pages unavailable; using the pagefile");
+    }
+    // SAFETY: plain section creation.
+    let handle = unsafe {
+        CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            std::ptr::null(),
+            // Under Wine a committed section is a sparse file, free until
+            // touched, and committing a reserved one page by page costs a
+            // wineserver request each that scans every range committed so
+            // far: commit it whole there.
+            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+            (size as u64 >> 32) as u32,
+            size as u32,
+            std::ptr::null(),
+        )
+    };
+    (!handle.is_null()).then_some((handle, None))
 }
 
 /// Where a page lives, or what a view starts with: a section and a page
@@ -418,38 +502,21 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): Grand Theft Auto VI asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
+    let Some((handle, file)) = create_section(size) else {
         let error = std::io::Error::last_os_error();
         tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
         // SAFETY: checked non-null.
         unsafe { count.write(0) };
         return 0;
-    }
+    };
     tracing::debug!(
         n,
         flags = format_args!("{flags:#x}"),
+        file_backed = file.is_some(),
         "XMemAllocatePhysicalPages"
     );
     SECTION_BYTES.fetch_add(size, Ordering::Relaxed);
-    let section = Arc::new(Section(handle, size));
+    let section = Arc::new(Section(handle, size, file));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -510,7 +577,7 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        commit(at.Value as usize, len).then_some(view)
+        commit(at.Value as usize, len, slice.section.2.is_some()).then_some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -886,6 +953,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         if !offset.is_multiple_of(PAGE) || !map_view(at, next - at, &part) {
             for &(view, len, _) in &made {
                 victory_gpu::title_memory_view_gone(view, len);
+                lazy_remove(view, len);
                 let view = MEMORY_MAPPED_VIEW_ADDRESS {
                     Value: view as *mut c_void,
                 };
@@ -932,7 +1000,7 @@ fn map_view(base: usize, len: usize, slice: &Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len) {
+    if !commit(base, len, slice.section.2.is_some()) {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
@@ -981,28 +1049,184 @@ fn split_at(at: usize) {
     }
 }
 
+/// Bytes of a view to commit up front when the host cannot commit it whole.
+/// The rest is committed when the title or one of our copiers first touches a
+/// 64 KiB page, so a 6.1 GiB pool does not use all of the host's commit
+/// headroom before the world has asked for a single byte.
+const LAZY_PREFIX: usize = 64 * MIB;
+
+// Local copies of the exception ABI: adding a windows-sys feature for one
+// vectored handler would change the dependency set for every target.
+#[repr(C)]
+struct ExceptionRecord {
+    exception_code: u32,
+    exception_flags: u32,
+    exception_record: *mut ExceptionRecord,
+    exception_address: *mut c_void,
+    number_parameters: u32,
+    exception_information: [usize; 15],
+}
+
+#[repr(C)]
+struct ExceptionPointers {
+    exception_record: *mut ExceptionRecord,
+    context_record: *mut c_void,
+}
+
+unsafe extern "system" {
+    fn AddVectoredExceptionHandler(
+        first: u32,
+        handler: Option<unsafe extern "system" fn(*mut ExceptionPointers) -> i32>,
+    ) -> *mut c_void;
+}
+
+const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
+
+/// Views whose untouched pages may be committed on first access.
+static LAZY: LazyLock<Mutex<BTreeMap<usize, usize>>> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
+static VEH: LazyLock<bool> = LazyLock::new(|| unsafe {
+    !AddVectoredExceptionHandler(1, Some(commit_on_demand)).is_null()
+});
+
+/// Whether untouched physical pages may be committed on first access. Off by
+/// default; the low-memory launcher opts in with `VICTORY_LAZY_PHYSICAL=1`.
+fn lazy_enabled() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("VICTORY_LAZY_PHYSICAL").is_some_and(|value| value == "1")
+    });
+    *ENABLED
+}
+
+/// Commits one 64 KiB page of a reserved-section view after an access fault.
+/// Only addresses inside a registered view are handled; every other fault
+/// keeps its normal path.
+unsafe extern "system" fn commit_on_demand(info: *mut ExceptionPointers) -> i32 {
+    if info.is_null() {
+        return 0;
+    }
+    let record = unsafe { (*info).exception_record };
+    if record.is_null() {
+        return 0;
+    }
+    let record = unsafe { &*record };
+    if record.exception_code != STATUS_ACCESS_VIOLATION || record.number_parameters < 2 {
+        return 0;
+    }
+    let page = record.exception_information[1] & !(PAGE - 1);
+    if !lazy_has(page) || !commit_fault_page(page) {
+        static WARNED: AtomicUsize = AtomicUsize::new(0);
+        if WARNED.fetch_add(1, Ordering::Relaxed) < 8 {
+            tracing::warn!(address = format_args!("{page:#x}"), "committing a physical page on demand failed");
+        }
+        return 0;
+    }
+    EXCEPTION_CONTINUE_EXECUTION
+}
+
+fn lazy_has(page: usize) -> bool {
+    let Ok(ranges) = LAZY.try_lock() else {
+        return false;
+    };
+    ranges
+        .range(..=page)
+        .next_back()
+        .is_some_and(|(start, end)| *start <= page && page < *end)
+}
+
+/// Commits the 64 KiB page a handled fault names. Kept separate from the
+/// handler so a game-free test can check it without raising an exception.
+fn commit_fault_page(page: usize) -> bool {
+    // SAFETY: a registered page of a reserved-section view.
+    !unsafe { VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null()
+}
+
+/// Remembers `[base, base + len)` as lazily committed. False if the handler
+/// could not be installed: leaving the pages reserved would fault the title.
+fn register_lazy(base: usize, len: usize) -> bool {
+    if !*VEH {
+        tracing::warn!("no vectored exception handler for lazily committed physical pages");
+        return false;
+    }
+    let mut ranges = LAZY.lock().unwrap_or_else(|e| e.into_inner());
+    ranges.insert(base, base + len);
+    true
+}
+
+/// Forgets unmapped bytes, keeping any parts of a range still mapped. Views
+/// never overlap, so only the range holding `base` and those starting inside
+/// can reach `[base, base + len)`.
+fn lazy_remove(base: usize, len: usize) {
+    let mut ranges = LAZY.lock().unwrap_or_else(|e| e.into_inner());
+    let end = base + len;
+    let hit: Vec<(usize, usize)> = ranges
+        .range(..=base)
+        .next_back()
+        .filter(|(_, stop)| **stop > base)
+        .map(|(&start, &stop)| (start, stop))
+        .into_iter()
+        .chain(ranges.range(base + 1..end).map(|(&at, &stop)| (at, stop)))
+        .collect();
+    for (start, stop) in hit {
+        ranges.remove(&start);
+        if start < base {
+            ranges.insert(start, base);
+        }
+        if stop > end {
+            ranges.insert(end, stop);
+        }
+    }
+}
+
 /// Commits the section pages a view shows (once per page, whichever view).
-fn commit(base: usize, len: usize) -> bool {
-    if on_wine() {
-        return true; // sections are committed whole there
+/// File-backed pages are already committed by the mapping and need no charge.
+fn commit(base: usize, len: usize, file_backed: bool) -> bool {
+    if file_backed || on_wine() {
+        return true;
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
         return true;
     }
     let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(ERROR_COMMITMENT_LIMIT as i32) {
-        let mut info = PERFORMANCE_INFORMATION {
-            cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
-            ..Default::default()
-        };
-        // SAFETY: the buffer and size describe a writable PERFORMANCE_INFORMATION.
-        let queried = unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0;
-        victory_loader::log_crash(&commit_limit_message(len, &error, queried.then_some(&info)));
-    } else {
+    if error.raw_os_error() != Some(ERROR_COMMITMENT_LIMIT as i32) {
         tracing::warn!(len, %error, "committing physical pages failed");
+        return false;
     }
-    false
+    let mut info = PERFORMANCE_INFORMATION {
+        cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the buffer and size describe a writable PERFORMANCE_INFORMATION.
+    let queried = unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0;
+    let report = commit_limit_message(len, &error, queried.then_some(&info));
+    if !lazy_enabled() {
+        victory_loader::log_crash(&report);
+        return false;
+    }
+
+    // A whole 6.1 GiB view is refused when the host has slightly less commit
+    // left. Commit a small prefix, then let accesses commit the rest. This
+    // keeps headroom for render targets and the title's other allocations.
+    let prefix = len.min(LAZY_PREFIX);
+    if prefix > 0
+        && unsafe { VirtualAlloc(base as *const c_void, prefix, MEM_COMMIT, PAGE_READWRITE) }
+            .is_null()
+    {
+        victory_loader::log_crash(&report);
+        return false;
+    }
+    if !register_lazy(base, len) {
+        victory_loader::log_crash(&report);
+        return false;
+    }
+    tracing::info!(
+        len,
+        prefix,
+        %error,
+        "physical pages committed on demand under commit pressure"
+    );
+    true
 }
 
 fn commit_limit_message(
@@ -1057,6 +1281,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         };
         victory_gpu::title_memory_remapped(at, size);
         victory_gpu::title_memory_view_gone(at, size);
+        lazy_remove(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(
@@ -1283,6 +1508,78 @@ mod tests {
             assert!(report.contains("Windows paging file size"));
         }
         assert!(!fallback.contains("System commit:"));
+    }
+
+    #[test]
+    fn file_backed_physical_pages_are_writable_without_commit() {
+        let dir = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap());
+        let Some((handle, file, path)) = file_section_in(&dir, 2 * PAGE) else {
+            panic!("could not make a file-backed section in {}", dir.display());
+        };
+        let section = Arc::new(Section(handle, 2 * PAGE, Some((file, path))));
+        let slice = Slice { section, index: 0 };
+        let mut a = View::map(&slice, 1).expect("map first page");
+        let mut b = View::map(&slice, 1).expect("map the same page again");
+
+        // The file mapping is committed as soon as it is made: no
+        // `VirtualAlloc(MEM_COMMIT)`, and therefore no pagefile charge.
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        assert_eq!(
+            unsafe { VirtualQuery(a.at.Value, &mut info, size_of_val(&info)) },
+            size_of_val(&info)
+        );
+        assert_eq!(info.State, MEM_COMMIT);
+        a.bytes()[3] = 7;
+        assert_eq!(b.bytes()[3], 7);
+    }
+
+    #[test]
+    fn lazy_physical_pages_commit_only_pages_the_title_touches() {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
+
+        // SAFETY: plain section and view creation of three 64 KiB pages.
+        let section = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_RESERVE,
+                0,
+                3 * PAGE as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 3 * PAGE) };
+        assert!(!view.Value.is_null());
+        let base = view.Value as usize;
+        assert!(register_lazy(base, 3 * PAGE));
+        assert!(lazy_has(base + PAGE + 1));
+
+        // Without the on-demand commit this page is reserved and a write
+        // faults; the helper is what the exception handler calls.
+        assert!(commit_fault_page(base + PAGE));
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: our own view into a sized structure.
+        assert_eq!(
+            unsafe { VirtualQuery((base + PAGE) as *const c_void, &mut info, size_of_val(&info)) },
+            size_of_val(&info)
+        );
+        assert_eq!(info.State, MEM_COMMIT);
+        // SAFETY: the page was just committed.
+        unsafe { ((base + PAGE + 7) as *mut u8).write(42) };
+        assert_eq!(unsafe { ((base + PAGE + 7) as *const u8).read() }, 42);
+
+        lazy_remove(base + PAGE, PAGE);
+        assert!(!lazy_has(base + PAGE + 1));
+        assert!(lazy_has(base + PAGE - 1), "first page still registered");
+        assert!(lazy_has(base + 2 * PAGE + 1), "third page still registered");
+        lazy_remove(base, 3 * PAGE);
+        assert!(!lazy_has(base + 2 * PAGE + 1));
+        // SAFETY: our own view and section.
+        assert_ne!(unsafe { UnmapViewOfFile(view) }, 0);
+        assert_ne!(unsafe { CloseHandle(section) }, 0);
     }
 
     #[test]

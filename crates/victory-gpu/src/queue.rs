@@ -12,6 +12,10 @@ use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table
 use crate::resource::PAGEABLE_IIDS;
 use crate::timeline::{Op, Timeline};
 
+/// Diagnostics-only instant of the previous present, for per-frame intervals.
+#[cfg(feature = "diagnostics")]
+static LAST_PRESENT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
 const QUEUE_IIDS: [Iid; 4] = [
     guid(
         0x0ec870a6,
@@ -362,6 +366,19 @@ extern "system" fn present(
 /// Shows a frame.
 fn show(shown: Option<object::Ref>, over: Option<object::Ref>) {
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(feature = "diagnostics")]
+    {
+        let now = std::time::Instant::now();
+        let mut last = LAST_PRESENT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(previous) = last.replace(now) {
+            tracing::debug!(
+                target: "victory_gpu::frame",
+                frame,
+                interval_us = now.duration_since(previous).as_micros() as u64,
+                "frame interval"
+            );
+        }
+    }
     #[cfg(windows)]
     crate::shadow::sweep(frame);
     if frame.is_power_of_two() {

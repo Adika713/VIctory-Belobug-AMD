@@ -104,6 +104,14 @@ victory run <game_scarlett_master.exe> --execute --console series-x
 
 The first launch after a build translates every shader and builds about
 2,500 pipelines; the loading screen can stay frozen, with sound, for minutes.
+`VICTORY_PRESENT_TARGET=1x1:1` above is diagnostics-only: it presents a 1x1
+render target, not the game image. Do not use it when looking for the world.
+
+For a low-memory launch, use `VICTORY_DISPLAY_MODE=1920x1080`,
+`VICTORY_WINDOW_BUDGET_MB=256`, `VICTORY_LAZY_PHYSICAL=1` and
+`VICTORY_FILE_PHYSICAL=1` with `--console series-x` (all four switches are off
+by default). The fork's `_agent_reports\run-story-low-memory.ps1` sets a
+known-good safe configuration and clears stale diagnostics variables first.
 
 ### Known problems
 
@@ -248,6 +256,11 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | Variable | Effect |
 |----------|--------|
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
+| `VICTORY_DISPLAY_MODE=<w>x<h>` | report that display mode to the title instead of 3840x2160; smaller values ask for smaller render targets |
+| `VICTORY_WINDOW_BUDGET_MB=<n>` | off by default; under system-RAM pressure, give back idle loose title-memory windows until their unique bytes fit `n` MiB; live copies are never touched |
+| `VICTORY_LAZY_PHYSICAL=1` | off by default; when Windows refuses a whole physical-page commit, commit a 64 MiB prefix and commit the remaining 64 KiB pages on first access; the pagefile is never changed |
+| `VICTORY_FILE_PHYSICAL=1` | off by default; back physical pages with temporary files in `VICTORY_CACHE_DIR` instead of the pagefile, so touching them does not consume Windows commit charge; files are removed on exit |
+| `VICTORY_TEXTURE_MAX=<px>` | off by default; sets the size limit at which streamed block textures lose their largest host mips (defaults 1024/512/256 as video memory fills); non-block, render-target, depth and unordered-access textures keep all their mips; lowers host texture commit at the cost of detail |
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |

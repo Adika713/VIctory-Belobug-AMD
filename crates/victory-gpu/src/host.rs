@@ -120,6 +120,146 @@ static RETIRED: Mutex<std::collections::VecDeque<Retired>> =
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Coarse milliseconds since this clock began, for idle ages. One query is a
+/// few nanoseconds, where a performance counter's is tens.
+pub(crate) fn coarse_ms() -> u64 {
+    use windows_sys::Win32::System::SystemInformation::GetTickCount64;
+    // SAFETY: a plain system query.
+    let now = unsafe { GetTickCount64() };
+    static BEGAN: OnceLock<u64> = OnceLock::new();
+    now.saturating_sub(*BEGAN.get_or_init(|| now))
+}
+
+/// A moment for idle bookkeeping: frames presented so far and tenths of a
+/// second since the start, in one word.
+pub(crate) fn moment() -> u64 {
+    (crate::frame::current() << 32) | ((coarse_ms() / 100) & 0xffff_ffff)
+}
+
+/// Whether `then` is at least `ms` milliseconds and `frames` frames back.
+/// Both are required: at seconds per frame what a frame uses is idle for
+/// seconds, and at many frames a second it must be idle for many frames.
+pub(crate) fn long_ago(then: u64, ms: u64, frames: u64) -> bool {
+    let now = self::moment();
+    let tenths = (now & 0xffff_ffff).saturating_sub(then & 0xffff_ffff);
+    (now >> 32).saturating_sub(then >> 32) >= frames && tenths * 100 >= ms
+}
+
+/// How long an idle title-memory window must have gone unused before it may
+/// be given back. Nothing is returned before that, and a failed measurement
+/// takes the conservative timeout.
+pub(crate) fn ram_idle_ms(free_physical: u64) -> u64 {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    if free_physical >= 12 * GIB {
+        300_000
+    } else if free_physical >= 4 * GIB {
+        10_000
+    } else if free_physical >= 2 * GIB {
+        5_000
+    } else {
+        2_000
+    }
+}
+
+/// System-RAM pressure band. Working set and private bytes describe this
+/// process; free physical memory and commit headroom guard the whole PC.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RamBand {
+    Calm,
+    Watch,
+    High,
+}
+
+/// Entering a higher band needs a higher watermark than leaving it, so a
+/// sample near a threshold does not toggle the policy every time.
+pub(crate) fn ram_band(
+    previous: RamBand,
+    working: u64,
+    private: u64,
+    free_physical: u64,
+    commit_headroom: u64,
+    total_physical: u64,
+    commit_limit: u64,
+) -> RamBand {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let high = private * 5 >= commit_limit * 4
+        || working * 2 >= total_physical
+        || free_physical < 2 * GIB
+        || commit_headroom < GIB;
+    let watch = private * 10 >= commit_limit * 7
+        || working * 4 >= total_physical
+        || free_physical < 4 * GIB
+        || commit_headroom < 2 * GIB;
+    let wanted = if high {
+        RamBand::High
+    } else if watch {
+        RamBand::Watch
+    } else {
+        RamBand::Calm
+    };
+    let safe_high = private * 20 <= commit_limit * 13
+        && working * 4 <= total_physical
+        && free_physical >= 4 * GIB
+        && commit_headroom >= 3 * GIB;
+    let safe_watch = private * 5 <= commit_limit * 3
+        && working * 5 <= total_physical
+        && free_physical >= 6 * GIB
+        && commit_headroom >= 3 * GIB;
+    match (previous, wanted) {
+        (RamBand::High, RamBand::Calm) if !safe_high => RamBand::Watch,
+        (RamBand::Watch, RamBand::Calm) if !safe_watch => RamBand::Watch,
+        _ => wanted,
+    }
+}
+
+/// The six numbers [`ram_band`] needs, from Windows; `None` if a query fails,
+/// so a caller can keep its old band rather than guess. Nothing here changes
+/// the pagefile.
+#[cfg(windows)]
+pub(crate) fn ram_sample() -> Option<(u64, u64, u64, u64, u64, u64)> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: plain data the call fills in.
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return None;
+    }
+    let mut c = PROCESS_MEMORY_COUNTERS {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our own process and a sized structure.
+    if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) } == 0 {
+        return None;
+    }
+    Some((
+        c.WorkingSetSize as u64,
+        c.PagefileUsage as u64,
+        m.ullAvailPhys,
+        m.ullAvailPageFile,
+        m.ullTotalPhys,
+        m.ullTotalPageFile,
+    ))
+}
+
+/// COM references held on a host object. Two is ours alone: no descriptor
+/// slot (`HostHeap::kept`) and no command list (`HostList::keep`) holds it.
+pub(crate) fn references(object: &impl Interface) -> u32 {
+    type Method = unsafe extern "system" fn(*mut std::ffi::c_void) -> u32;
+    let raw = object.as_raw();
+    // SAFETY: a live COM object; the add and release pair leaves the count
+    // as it was, and the release returns it.
+    unsafe {
+        let methods = *raw.cast::<*const [Method; 3]>();
+        ((*methods)[1])(raw);
+        ((*methods)[2])(raw)
+    }
+}
+
 /// Presented host frames a retired object is also kept for. Worker threads
 /// record lists ahead of submission and a title frame spans many
 /// submissions, so finishing the submissions running when it was retired
@@ -532,6 +672,52 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ram_band_tracks_resident_and_commit_pressure() {
+        use super::{RamBand, ram_band};
+        const M: u64 = 1 << 20;
+        // The measured local Series S baseline stays calm on a 32 GB host.
+        assert_eq!(
+            ram_band(RamBand::Calm, 3857 * M, 7500 * M, 15900 * M, 3962 * M, 32 * 1024 * M, 11 * 1024 * M),
+            RamBand::Calm
+        );
+        // Private commit alone crosses the watch watermark.
+        assert_eq!(
+            ram_band(RamBand::Calm, 3857 * M, 8200 * M, 15900 * M, 3962 * M, 32 * 1024 * M, 11 * 1024 * M),
+            RamBand::Watch
+        );
+        // The measured Series X commit failure is High: only 154 MiB of
+        // commit headroom with 16 GB of physical memory still free.
+        assert_eq!(
+            ram_band(RamBand::Calm, 4452 * M, 10191 * M, 16047 * M, 154 * M, 32 * 1024 * M, 11 * 1024 * M),
+            RamBand::High
+        );
+    }
+
+    #[test]
+    fn ram_band_exits_only_below_lower_watermarks() {
+        use super::{RamBand, ram_band};
+        const M: u64 = 1 << 20;
+        assert_eq!(
+            ram_band(RamBand::High, 4452 * M, 8900 * M, 16047 * M, 1200 * M, 32 * 1024 * M, 11 * 1024 * M),
+            RamBand::Watch
+        );
+        assert_eq!(
+            ram_band(RamBand::Watch, 3857 * M, 6600 * M, 15900 * M, 3962 * M, 32 * 1024 * M, 11 * 1024 * M),
+            RamBand::Calm
+        );
+    }
+
+    #[test]
+    fn ram_idle_timeout_shortens_only_under_pressure() {
+        use super::ram_idle_ms;
+        const GIB: u64 = 1 << 30;
+        assert_eq!(ram_idle_ms(16 * GIB), 300_000);
+        assert_eq!(ram_idle_ms(8 * GIB), 10_000);
+        assert_eq!(ram_idle_ms(3 * GIB), 5_000);
+        assert_eq!(ram_idle_ms(GIB), 2_000);
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;

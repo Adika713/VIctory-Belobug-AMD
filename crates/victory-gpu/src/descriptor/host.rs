@@ -499,10 +499,6 @@ pub(crate) fn near_heaps(va: u64) -> String {
     text
 }
 
-/// The host's limit for shader-visible view heaps on resource binding
-/// tiers 1 and 2; tier 3 hardware may take more.
-const PORTABLE_VIEWS: u32 = 1_000_000;
-
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released. A world
@@ -511,9 +507,21 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// subsurface resolve, tree imposters). `victory_shader::emit::VIEW_SLOTS`
 /// is the title's 1,245,184 slots, these and those of [`crate::memory`].
 const DYNAMIC: u32 = 1 << 20;
-/// Smaller dynamic reserve when the host caps the whole view heap at
-/// [`PORTABLE_VIEWS`].
+/// Smaller dynamic reserve to try when the driver refuses the full heap.
 const DYNAMIC_CAPPED: u32 = 1 << 16;
+
+/// Reserves to try, largest first, when a view heap cannot be made. The
+/// title's own slots are kept in every try: shaders keep indices into them,
+/// so a heap shorter than `count` would make draws read nothing at all.
+fn dynamic_reserves(full: u32) -> Vec<u32> {
+    let mut tries = Vec::new();
+    for reserve in [full, DYNAMIC_CAPPED, 0] {
+        if reserve <= full && !tries.contains(&reserve) {
+            tries.push(reserve);
+        }
+    }
+    tries
+}
 
 /// The host's limit for shader-visible sampler heaps, on every binding
 /// tier.
@@ -580,30 +588,42 @@ impl HostHeap {
         }
         let extra = if sampler { 0 } else { DYNAMIC };
         let wanted = count;
-        let (heap, count, extra) = match make(count + extra) {
-            Ok(heap) => (heap, count, extra),
-            Err(e) if !sampler && count + extra + crate::memory::SLOTS > PORTABLE_VIEWS => {
-                // shortcut: descriptors past the host's limit are left out;
-                // draw::tables now remaps the root tables that reach them.
-                tracing::warn!(
-                    error = %e,
-                    wanted,
-                    made = PORTABLE_VIEWS - DYNAMIC_CAPPED,
-                    lost = wanted + DYNAMIC_CAPPED - PORTABLE_VIEWS,
-                    "host view heap capped at {PORTABLE_VIEWS}"
-                );
-                (
-                    make(PORTABLE_VIEWS - crate::memory::SLOTS).ok()?,
-                    PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS,
-                    DYNAMIC_CAPPED,
-                )
+        let mut last_error = None;
+        let mut made = None;
+        for reserve in dynamic_reserves(extra) {
+            match make(count.saturating_add(reserve)) {
+                Ok(heap) => {
+                    made = Some((heap, reserve));
+                    break;
+                }
+                Err(e) => {
+                    if reserve != 0 {
+                        tracing::warn!(
+                            error = %e,
+                            wanted,
+                            reserve,
+                            "host view heap with this dynamic reserve failed; trying fewer slots"
+                        );
+                    }
+                    last_error = Some(e);
+                }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                return None;
+        }
+        let Some((heap, made_extra)) = made else {
+            if let Some(error) = last_error {
+                tracing::warn!(error = %error, wanted, "no host descriptor heap");
             }
+            return None;
         };
-        Some(Self::with(host, heap, kind, count, extra))
+        if made_extra < extra {
+            tracing::warn!(
+                wanted,
+                full = extra,
+                made = made_extra,
+                "host view heap made with a smaller dynamic reserve"
+            );
+        }
+        Some(Self::with(host, heap, kind, count, made_extra))
     }
 
     /// The host heap over `heap`: `count` title slots, then `extra` dynamic
@@ -2435,6 +2455,22 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
 }
 
 /// `d` made a view of a texture without the `skip` largest mips.
+fn without_mips_uav(d: &mut D3D12_UNORDERED_ACCESS_VIEW_DESC, skip: u32) {
+    let cut = |slice: &mut u32| {
+        *slice = slice.saturating_sub(skip);
+    };
+    // SAFETY: the member the dimension names.
+    unsafe {
+        match d.ViewDimension {
+            D3D12_UAV_DIMENSION_TEXTURE2D => cut(&mut d.Anonymous.Texture2D.MipSlice),
+            D3D12_UAV_DIMENSION_TEXTURE2DARRAY => cut(&mut d.Anonymous.Texture2DArray.MipSlice),
+            D3D12_UAV_DIMENSION_TEXTURE3D => cut(&mut d.Anonymous.Texture3D.MipSlice),
+            _ => {}
+        }
+    }
+}
+
+/// `d` made a view of a texture without the `skip` largest mips.
 fn without_mips(d: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, skip: u32) {
     let cut = |first: &mut u32, levels: &mut u32, clamp: Option<&mut f32>| {
         if *levels != u32::MAX {
@@ -2544,6 +2580,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let mut desc = desc.as_ref().map(uav_desc);
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
+            }
+            let skip = crate::resource::skipped_mips(resource);
+            if skip > 0
+                && let Some(d) = &mut desc
+            {
+                without_mips_uav(d, skip);
             }
             // SAFETY: a live texture and a slot of our heap.
             unsafe {
@@ -2822,6 +2864,13 @@ mod tests {
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
     use windows::core::s;
+
+    #[test]
+    fn dynamic_reserves_shrink_without_capping_title_slots() {
+        assert_eq!(dynamic_reserves(DYNAMIC), vec![DYNAMIC, DYNAMIC_CAPPED, 0]);
+        assert_eq!(dynamic_reserves(DYNAMIC_CAPPED), vec![DYNAMIC_CAPPED, 0]);
+        assert_eq!(dynamic_reserves(0), vec![0]);
+    }
 
     const HEAP_IID: Iid = guid(
         0x8efb471d,

@@ -16,8 +16,8 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -55,6 +55,8 @@ pub(crate) struct Shadow {
     sparse: Option<Sparse>,
     /// Device-local VRAM mirror (`DEFAULT`) + Wave64 GPU hash state (`card.rs`).
     card: Option<Arc<crate::card::CardState>>,
+    /// When a draw last used this copy, for idle eviction of loose windows.
+    used: AtomicU64,
 }
 
 struct Direct {
@@ -281,6 +283,7 @@ impl Shadow {
             clean_spans: Mutex::default(),
             sparse: None,
             card,
+            used: AtomicU64::new(crate::host::moment()),
         }
     }
 
@@ -1040,6 +1043,7 @@ fn placed(
         clean_spans: Mutex::default(),
         sparse: None,
         card: None,
+        used: AtomicU64::new(crate::host::moment()),
     })
 }
 
@@ -1556,6 +1560,9 @@ fn sweeps() -> u8 {
 /// Gives back the tiles nothing has asked about for some frames: what
 /// viewed them is gone. At the present of `frame`.
 pub(crate) fn sweep(frame: u64) {
+    // Opt-in system-RAM cap for loose windows. Separate from tile sweeping,
+    // which is off by default (`VICTORY_SWEEP_TILES`).
+    let_go_windows(frame);
     const EVERY: u64 = 32;
     let mode = sweeps();
     if !frame.is_multiple_of(EVERY) || mode == 0 {
@@ -1776,6 +1783,7 @@ fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow
             of,
         }),
         card: None,
+        used: AtomicU64::new(crate::host::moment()),
     })
 }
 
@@ -2376,6 +2384,123 @@ const WINDOW: u64 = 4 << 20;
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// Optional cap on idle loose-window bytes, in MiB (`VICTORY_WINDOW_BUDGET_MB`).
+/// Unset or `0` leaves the old behaviour: those copies are never freed. A
+/// positive value only applies under system-RAM pressure; Calm is unchanged.
+fn window_budget() -> Option<u64> {
+    static MB: OnceLock<Option<u64>> = OnceLock::new();
+    *MB.get_or_init(|| {
+        std::env::var("VICTORY_WINDOW_BUDGET_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .map(|v| v.saturating_mul(1 << 20))
+    })
+}
+
+/// Oldest eligible copies to remove until their unique bytes fit `keep`.
+/// Entries are `(last-used moment, bytes, identity)`, oldest first; one copy
+/// standing under several keys is counted once.
+fn window_victims(entries: &[(u64, u64, usize)], keep: u64) -> Vec<usize> {
+    let mut left = 0u64;
+    let mut seen = std::collections::HashSet::new();
+    for &(_, bytes, id) in entries {
+        if seen.insert(id) {
+            left = left.saturating_add(bytes);
+        }
+    }
+    let mut out = Vec::new();
+    for (i, &(_, bytes, id)) in entries.iter().enumerate() {
+        if left <= keep {
+            break;
+        }
+        if seen.remove(&id) {
+            left = left.saturating_sub(bytes);
+            out.push(i);
+        }
+    }
+    out
+}
+
+/// Kept between checks so one sample near a watermark does not toggle policy.
+static WINDOW_BAND: Mutex<crate::host::RamBand> = Mutex::new(crate::host::RamBand::Calm);
+
+/// Give back loose windows nothing can reference any more, when system memory
+/// is under pressure and the configured cap is set. A list holding the copy
+/// (`Arc`) or a descriptor holding its buffer (COM reference) keeps it alive;
+/// so does the idle timeout. Only copies under the oldest eligible keys go.
+fn let_go_windows(frame: u64) {
+    const EVERY: u64 = 8;
+    const IDLE_FRAMES: u64 = 4;
+    if !frame.is_multiple_of(EVERY) {
+        return;
+    }
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    if LAST.swap(frame, Ordering::Relaxed) == frame {
+        return;
+    }
+    let Some(bytes) = window_budget() else { return };
+    let sample = crate::host::ram_sample();
+    let mut idle_ms = crate::host::ram_idle_ms(
+        sample.map_or(u64::MAX, |(_, _, free, _, _, _)| free),
+    );
+    let mut keep = u64::MAX;
+    if let Some((working, private, free, commit, total, limit)) = sample {
+        let mut band = WINDOW_BAND.lock().unwrap_or_else(|e| e.into_inner());
+        *band = crate::host::ram_band(*band, working, private, free, commit, total, limit);
+        match *band {
+            crate::host::RamBand::Calm => {}
+            crate::host::RamBand::Watch => {
+                idle_ms = idle_ms.min(10_000);
+                keep = bytes;
+            }
+            crate::host::RamBand::High => {
+                idle_ms = idle_ms.min(2_000);
+                keep = bytes / 2;
+            }
+        }
+    }
+    if keep == u64::MAX {
+        return;
+    }
+    let gone: Vec<Arc<Shadow>> = {
+        // Held from the look to the removal: `loose` hands a copy out under
+        // the same lock, so none can be handed out in between.
+        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        if map.is_empty() {
+            return;
+        }
+        let mut eligible: Vec<(u64, (u64, u64), usize, u64)> = map
+            .iter()
+            .filter(|(_, s)| {
+                Arc::strong_count(s) == 1
+                    && crate::host::references(&s.buffer) == 1
+                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+            })
+            .map(|(&key, s)| {
+                (s.used.load(Ordering::Relaxed), key, Arc::as_ptr(s) as usize, s.len)
+            })
+            .collect();
+        eligible.sort_unstable_by_key(|&(used, _, _, _)| used);
+        let entries: Vec<(u64, u64, usize)> = eligible
+            .iter()
+            .map(|&(used, _, id, len)| (used, len, id))
+            .collect();
+        window_victims(&entries, keep)
+            .into_iter()
+            .filter_map(|i| map.remove(&eligible[i].1))
+            .collect()
+    };
+    if !gone.is_empty() {
+        let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
+        tracing::info!(
+            copies = went,
+            megabytes = bytes >> 20,
+            "idle title-memory windows given back under RAM pressure"
+        );
+    }
+}
+
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if let Some(copy) = sparse(address, end) {
         return Some(copy);
@@ -2392,6 +2517,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         .find(|((s, l), _)| *s <= address && s + l >= end)
         .map(|(_, shadow)| shadow.clone())
     {
+        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
         return Some(shadow);
     }
     let h = host()?;
@@ -2466,6 +2592,21 @@ pub(crate) fn near(va: u64) -> String {
 mod tests {
     use super::*;
     use std::ops::Range;
+
+    #[test]
+    fn window_budget_evicts_oldest_only_until_it_fits() {
+        const M: u64 = 1 << 20;
+        let entries = [(1u64, 10 * M, 1usize), (2, 20 * M, 2), (3, 30 * M, 3)];
+        assert_eq!(window_victims(&entries, 50 * M), vec![0]);
+        assert_eq!(window_victims(&entries, 20 * M), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn window_budget_counts_one_copy_under_several_keys_once() {
+        const M: u64 = 1 << 20;
+        let entries = [(1u64, 30 * M, 7usize), (2, 30 * M, 7), (3, 20 * M, 8)];
+        assert_eq!(window_victims(&entries, 40 * M), vec![0]);
+    }
 
     #[test]
     fn partial_match_leaves_unchecked_bytes_visible() {

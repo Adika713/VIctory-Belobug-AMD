@@ -1137,37 +1137,21 @@ fn video_memory_percent() -> u64 {
     last.1
 }
 
-/// How many of a streamed texture's largest mips to do without, for none of
-/// its sides to pass `VICTORY_TEXTURE_MAX`: by default 1024, 512 and then 256 as
-/// video memory fills up. All textures together did not fit, and paging them
-/// cost seconds a frame, or the driver failed.
+/// `VICTORY_TEXTURE_MAX`, when the launcher sets it. Zero keeps the old
+/// behaviour.
 #[cfg(windows)]
-fn over_cap(d: &ResourceDesc) -> u32 {
+fn texture_max() -> Option<u64> {
     static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let set = *SET.get_or_init(|| {
+    *SET.get_or_init(|| {
         std::env::var("VICTORY_TEXTURE_MAX")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-    });
-    if !STREAMED.get() || textures() != Textures::Stream {
-        return 0;
-    }
-    let max = set.unwrap_or_else(|| match video_memory_percent() {
-        0..70 => 1024,
-        70..85 => 512,
-        _ => 256,
-    });
-    const TEXTURE2D: u32 = 3;
-    let block = (70..=84).contains(&d.format) || (94..=99).contains(&d.format);
-    if cfg!(test)
-        || max == 0
-        || d.dimension != TEXTURE2D
-        || d.flags & 7 != 0
-        || !block
-        || d.mip_levels < 2
-    {
-        return 0;
-    }
+    })
+}
+
+/// Largest mips to do without for no side to pass `max`.
+#[cfg(windows)]
+fn mips_over(d: &ResourceDesc, max: u64) -> u32 {
     let mut skip = 0;
     while (d.width.max(u64::from(d.height)) >> skip) > max
         && skip + 1 < u32::from(d.mip_levels)
@@ -1179,6 +1163,56 @@ fn over_cap(d: &ResourceDesc) -> u32 {
         skip += 1;
     }
     skip
+}
+
+/// How many of a texture's largest mips the host copy goes without. By
+/// default, only streamed block textures get 1024, 512 or 256 as video memory
+/// fills up: all of them together did not fit and paging cost seconds a frame.
+/// An explicit `VICTORY_TEXTURE_MAX` only overrides the size limit for
+/// eligible streamed block textures, never their kind or use flags.
+/// A capped texture has fewer mips than the title's views may name; a view
+/// asking for a larger one removes the host device.
+#[cfg(windows)]
+fn over_cap_for(
+    d: &ResourceDesc,
+    explicit: Option<u64>,
+    streamed: bool,
+    mode: Textures,
+    video_percent: u64,
+) -> u32 {
+    if !streamed || mode != Textures::Stream {
+        return 0;
+    }
+    let max = explicit.unwrap_or_else(|| match video_percent {
+        0..70 => 1024,
+        70..85 => 512,
+        _ => 256,
+    });
+    const TEXTURE2D: u32 = 3;
+    let block = (70..=84).contains(&d.format) || (94..=99).contains(&d.format);
+    if max == 0
+        || d.dimension != TEXTURE2D
+        || d.flags & 7 != 0
+        || !block
+        || d.mip_levels < 2
+    {
+        return 0;
+    }
+    mips_over(d, max)
+}
+
+#[cfg(windows)]
+fn over_cap(d: &ResourceDesc) -> u32 {
+    if cfg!(test) {
+        return 0;
+    }
+    over_cap_for(
+        d,
+        texture_max(),
+        STREAMED.get(),
+        textures(),
+        video_memory_percent(),
+    )
 }
 
 /// The title's largest mips the host copy of a texture goes without.
@@ -2887,5 +2921,46 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn explicit_texture_max_keeps_non_eligible_textures_whole() {
+        let d = ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width: 1024,
+            height: 1024,
+            depth_or_array_size: 1,
+            mip_levels: 4,
+            format: 28,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 0,
+        };
+        // A non-block texture is never capped, even with an explicit limit.
+        assert_eq!(over_cap_for(&d, Some(256), true, Textures::Stream, 0), 0);
+        // A texture the host can write as a UAV must keep its larger mips:
+        // views name them, and a short resource removes the host device.
+        let uav = ResourceDesc {
+            format: 70,
+            flags: 4,
+            ..d
+        };
+        assert_eq!(over_cap_for(&uav, Some(256), true, Textures::Stream, 0), 0);
+        // So must a texture the title places in its own memory.
+        assert_eq!(over_cap_for(&uav, Some(256), false, Textures::Keep, 0), 0);
+        // The default streamed-block behaviour is unchanged; an explicit
+        // limit only changes the size, and zero turns the cap off.
+        let block = ResourceDesc {
+            width: 4096,
+            height: 4096,
+            mip_levels: 6,
+            format: 70,
+            ..d
+        };
+        assert_eq!(over_cap_for(&block, None, true, Textures::Stream, 0), 2);
+        assert_eq!(over_cap_for(&block, Some(256), true, Textures::Stream, 0), 4);
+        assert_eq!(over_cap_for(&block, Some(0), true, Textures::Stream, 0), 0);
     }
 }

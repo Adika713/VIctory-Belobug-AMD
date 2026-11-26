@@ -1915,6 +1915,21 @@ impl<T> Spare<T> {
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
+/// Report-only scratch/list allocator attribution: spare kept count, spare kept
+/// bytes, scratch pool enabled, lazy prelude enabled, first chunk bytes, normal
+/// chunk bytes.
+pub(crate) fn scratch_stats() -> [u64; 6] {
+    let spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    [
+        spare.kept.len() as u64,
+        spare.bytes,
+        u64::from(scratch_pool()),
+        u64::from(lazy_prelude()),
+        SCRATCH_FIRST,
+        SCRATCH_CHUNK,
+    ]
+}
+
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     if scratch_pool()
@@ -10395,6 +10410,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(None), 10_000);
     }
 }
+
 
 
 

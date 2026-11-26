@@ -16,15 +16,19 @@ pub fn report() -> String {
         let retired: Vec<u64> = crate::host::RETIRED_STATS.iter().map(|a| a.load(Relaxed)).collect();
         let deferred: Vec<u64> = crate::host::DEFERRED_UPLOAD_STATS.iter().map(|a| a.load(Relaxed)).collect();
         let deferred_kept = crate::host::DEFERRED_KEPT_STATS.load(Relaxed);
+        let scratch = crate::host::scratch_stats();
         let _ = write!(
             line,
-            " host lists alive {}, scratch chunks alive {} ({} MiB, spare {} / {} MiB, reused {}), other upload buffers alive {} ({} MiB), deferred uploads {} ({} MiB, kept {}), lists made {}, preludes {}, never-reset alive {}, list-make private {} MiB, retired queued {} (res {} MiB, any {})",
+            " host lists alive {}, scratch chunks alive {} ({} MiB, spare {} / {} MiB, reused {}, pool {}, first {} KiB, chunk {} MiB), other upload buffers alive {} ({} MiB), deferred uploads {} ({} MiB, kept {}), lists made {}, preludes {}, never-reset alive {}, list-make private {} MiB, lazy-prelude {}, retired queued {} (res {} MiB, any {})",
             alive.get(0).copied().unwrap_or(0),
             alive.get(1).copied().unwrap_or(0),
             mib(alive.get(2).copied().unwrap_or(0)),
             alive.get(3).copied().unwrap_or(0),
             mib(alive.get(4).copied().unwrap_or(0)),
             alive.get(5).copied().unwrap_or(0),
+            scratch.get(2).copied().unwrap_or(0),
+            scratch.get(4).copied().unwrap_or(0) >> 10,
+            mib(scratch.get(5).copied().unwrap_or(0)),
             alive.get(6).copied().unwrap_or(0),
             mib(alive.get(7).copied().unwrap_or(0)),
             deferred.get(0).copied().unwrap_or(0),
@@ -34,6 +38,7 @@ pub fn report() -> String {
             lists.get(1).copied().unwrap_or(0),
             lists.get(3).copied().unwrap_or(0),
             mib(lists.get(2).copied().unwrap_or(0)),
+            scratch.get(3).copied().unwrap_or(0),
             retired.get(0).copied().unwrap_or(0),
             mib(retired.get(1).copied().unwrap_or(0)),
             retired.get(2).copied().unwrap_or(0),
@@ -120,8 +125,12 @@ mod tests {
         assert!(line.contains("retired queued"), "{line}");
         assert!(line.contains("deferred uploads"), "{line}");
         assert!(line.contains("kept "), "{line}");
+        assert!(line.contains("lazy-prelude"), "{line}");
+        assert!(line.contains("pool "), "{line}");
     }
 }
+
+
 
 
 

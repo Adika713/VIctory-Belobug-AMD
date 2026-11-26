@@ -1,4 +1,4 @@
-//! Heaps, committed and placed resources, and resource sizes.
+﻿//! Heaps, committed and placed resources, and resource sizes.
 //!
 //! Heaps and resources are host memory and a resource's GPU address is its
 //! CPU address, as on the console; textures also get a host copy, and
@@ -187,6 +187,18 @@ pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
 /// aligned), textures their console layout (formats it does not know:
 /// every mip of every array slice and sample, packed, 64 KiB aligned),
 /// rounded up to the alignment.
+pub(crate) fn footprint_size(desc: &ResourceDesc) -> u64 {
+    footprint(desc).map_or(0, |f| f.size)
+}
+
+#[cfg(windows)]
+pub(crate) fn retired_resource_bytes(res: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> u64 {
+    use windows::core::Interface;
+    let this = res.as_raw() as crate::object::This;
+    if this.is_null() { return 0; }
+    footprint_size(resource(this).desc_ref())
+}
+
 fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
     if desc.dimension != BUFFER
         && let Some(t) = texture_layout(desc)
@@ -1655,7 +1667,7 @@ pub(crate) fn host_made<'a>(
 
 /// Unconditional host-texture floor for a given local VRAM budget (`None` when
 /// the adapter does not report one): up to 2 GiB, capped at a quarter of the
-/// reported budget so 4–6 GiB cards do not bypass the budget check early.
+/// reported budget so 4â€“6 GiB cards do not bypass the budget check early.
 #[cfg(any(windows, test))]
 fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
     const MAX_FLOOR: u64 = 2 << 30;
@@ -2629,6 +2641,10 @@ pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
 }
 
 impl Resource {
+    pub(crate) fn desc_ref(&self) -> &ResourceDesc {
+        &self.desc
+    }
+
     fn data(&self) -> *mut u8 {
         match self.backing {
             Backing::Committed(ref memory) => memory.ptr.as_ptr(),
@@ -4569,3 +4585,6 @@ float4 lit() : SV_Target { return 1.0; }
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
     }
 }
+
+
+

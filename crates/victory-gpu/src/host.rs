@@ -1,4 +1,4 @@
-//! The host GPU: one D3D12 device and direct queue (decision 0007), and a
+﻿//! The host GPU: one D3D12 device and direct queue (decision 0007), and a
 //! window to present on.
 //!
 //! shortcut: every submission is waited for, so CPU and GPU never overlap
@@ -457,6 +457,8 @@ pub(crate) fn retire<T: 'static>(object: T) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
+    RETIRED_STATS[0].fetch_add(1, Ordering::Relaxed);
+    RETIRED_STATS[2].fetch_add(1, Ordering::Relaxed);
     RETIRED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -473,6 +475,9 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
+    let bytes = crate::resource::retired_resource_bytes(&object);
+    RETIRED_STATS[0].fetch_add(1, Ordering::Relaxed);
+    RETIRED_STATS[1].fetch_add(bytes, Ordering::Relaxed);
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
 }
 
@@ -498,7 +503,21 @@ fn bury(finished: u64) {
         if n == 0 {
             return;
         }
-        retired.drain(..n).collect()
+        let done: Vec<(u64, Retired)> = retired.drain(..n).collect();
+        let mut bytes = 0u64;
+        let mut any = 0u64;
+        for (_, r) in &done {
+            match r {
+                Retired::Any(_) => any += 1,
+                Retired::Resource(res) => {
+                    bytes += crate::resource::retired_resource_bytes(&res);
+                }
+            }
+        }
+        RETIRED_STATS[0].fetch_sub(done.len() as u64, Ordering::Relaxed);
+        RETIRED_STATS[1].fetch_sub(bytes, Ordering::Relaxed);
+        RETIRED_STATS[2].fetch_sub(any, Ordering::Relaxed);
+        done
     };
     drop(done);
 }
@@ -506,6 +525,11 @@ fn bury(finished: u64) {
 /// Objects [`retire`] dropped at once (no submission was running) and
 /// kept until a running submission finished, since the start.
 static RETIREMENTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// Retired queue attribution (report-only): entries currently queued, queued
+/// resource bytes (best-effort from resource desc at retire), and queued Any
+/// entries. Counts are decremented when bury() drops them.
+pub(crate) static RETIRED_STATS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// What the layer did to the host's objects lately, newest last (sweeps
 /// that let host copies go, pipeline library calls, saves and trims): said
@@ -10353,4 +10377,8 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(None), 10_000);
     }
 }
+
+
+
+
 

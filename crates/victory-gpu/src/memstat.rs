@@ -13,9 +13,10 @@ pub fn report() -> String {
         let alive: Vec<u64> = crate::host::ALIVE.iter().map(|a| a.load(Relaxed)).collect();
         let made: Vec<u64> = crate::host::MADE.iter().map(|a| a.load(Relaxed)).collect();
         let lists: Vec<u64> = crate::host::LISTS.iter().map(|a| a.load(Relaxed)).collect();
+        let retired: Vec<u64> = crate::host::RETIRED_STATS.iter().map(|a| a.load(Relaxed)).collect();
         let _ = write!(
             line,
-            " host lists alive {}, scratch chunks alive {} ({} MiB, spare {} / {} MiB, reused {}), other upload buffers alive {} ({} MiB), lists made {}, preludes {}, never-reset alive {}",
+            " host lists alive {}, scratch chunks alive {} ({} MiB, spare {} / {} MiB, reused {}), other upload buffers alive {} ({} MiB), lists made {}, preludes {}, never-reset alive {}, retired queued {} (res {} MiB, any {})",
             alive.get(0).copied().unwrap_or(0),
             alive.get(1).copied().unwrap_or(0),
             mib(alive.get(2).copied().unwrap_or(0)),
@@ -27,6 +28,9 @@ pub fn report() -> String {
             lists.get(0).copied().unwrap_or(0),
             lists.get(1).copied().unwrap_or(0),
             lists.get(3).copied().unwrap_or(0),
+            retired.get(0).copied().unwrap_or(0),
+            mib(retired.get(1).copied().unwrap_or(0)),
+            retired.get(2).copied().unwrap_or(0),
         );
 
         #[cfg(feature = "diagnostics")]
@@ -89,5 +93,8 @@ mod tests {
         let line = report();
         assert!(line.contains("host lists alive"), "{line}");
         assert!(line.contains("scratch chunks alive"), "{line}");
+        assert!(line.contains("retired queued"), "{line}");
     }
 }
+
+

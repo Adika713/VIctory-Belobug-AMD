@@ -1951,7 +1951,33 @@ fn register_lazy(base: usize, len: usize) -> bool {
         tracing::warn!("VICTORY_LAZY_PHYSICAL=1 requested but VEH install failed; using eager commit");
         return false;
     }
-    LAZY.lock().unwrap_or_else(|e| e.into_inner()).insert(base, base + len);
+    let mut ranges = LAZY.lock().unwrap_or_else(|e| e.into_inner());
+    let mut start = base;
+    let mut end = base.saturating_add(len);
+    // Merge overlapping/adjacent ranges so lazy_has/ensure_lazy_committed stay simple.
+    loop {
+        let prev = ranges
+            .range(..=start.saturating_add(PAGE))
+            .next_back()
+            .filter(|(_, stop)| **stop >= start)
+            .map(|(&s, &e)| (s, e));
+        let Some((s, e)) = prev else { break };
+        ranges.remove(&s);
+        start = start.min(s);
+        end = end.max(e);
+    }
+    loop {
+        let next = ranges
+            .range(start..=end.saturating_add(PAGE))
+            .next()
+            .filter(|(s, _)| **s <= end.saturating_add(PAGE))
+            .map(|(&s, &e)| (s, e));
+        let Some((s, e)) = next else { break };
+        ranges.remove(&s);
+        start = start.min(s);
+        end = end.max(e);
+    }
+    ranges.insert(start, end);
     HAS_LAZY.store(true, Ordering::Release);
     true
 }

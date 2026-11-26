@@ -740,7 +740,20 @@ fn create_physical_section(size: usize) -> Option<(HANDLE, Option<(std::fs::File
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
-            if let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path) {
+            #[cfg(windows)]
+            let open = {
+                use std::os::windows::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .custom_flags(0x04000000 /* FILE_FLAG_DELETE_ON_CLOSE */)
+                    .share_mode(0x00000004 /* FILE_SHARE_DELETE */)
+                    .open(&path)
+            };
+            #[cfg(not(windows))]
+            let open = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path);
+            if let Ok(file) = open {
                 if file.set_len(size as u64).is_ok() {
                     // SAFETY: `file` remains open in the returned tuple.
                     let handle = unsafe {

@@ -530,6 +530,10 @@ static RETIREMENTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atom
 /// entries. Counts are decremented when bury() drops them.
 pub(crate) static RETIRED_STATS: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// Deferred upload retention (report-only): buffers currently held by live
+/// deferred command-list state and their bytes. Updated on hold/drop/reset.
+pub(crate) static DEFERRED_UPLOAD_STATS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// What the layer did to the host's objects lately, newest last (sweeps
 /// that let host copies go, pipeline library calls, saves and trims): said
@@ -2281,6 +2285,8 @@ impl Deferred {
     fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
         ALIVE[6].fetch_add(1, Ordering::Relaxed);
         ALIVE[7].fetch_add(size, Ordering::Relaxed);
+        DEFERRED_UPLOAD_STATS[0].fetch_add(1, Ordering::Relaxed);
+        DEFERRED_UPLOAD_STATS[1].fetch_add(size, Ordering::Relaxed);
         self.upload_bytes += size;
         self.uploads.push(buffer);
     }
@@ -2296,8 +2302,12 @@ impl Deferred {
 
 impl Drop for Deferred {
     fn drop(&mut self) {
-        ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
-        ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        let count = self.uploads.len() as u64;
+        let bytes = self.upload_bytes;
+        ALIVE[6].fetch_sub(count, Ordering::Relaxed);
+        ALIVE[7].fetch_sub(bytes, Ordering::Relaxed);
+        DEFERRED_UPLOAD_STATS[0].fetch_sub(count, Ordering::Relaxed);
+        DEFERRED_UPLOAD_STATS[1].fetch_sub(bytes, Ordering::Relaxed);
     }
 }
 
@@ -10377,6 +10387,8 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(None), 10_000);
     }
 }
+
+
 
 
 

@@ -14,9 +14,10 @@ pub fn report() -> String {
         let made: Vec<u64> = crate::host::MADE.iter().map(|a| a.load(Relaxed)).collect();
         let lists: Vec<u64> = crate::host::LISTS.iter().map(|a| a.load(Relaxed)).collect();
         let retired: Vec<u64> = crate::host::RETIRED_STATS.iter().map(|a| a.load(Relaxed)).collect();
+        let deferred: Vec<u64> = crate::host::DEFERRED_UPLOAD_STATS.iter().map(|a| a.load(Relaxed)).collect();
         let _ = write!(
             line,
-            " host lists alive {}, scratch chunks alive {} ({} MiB, spare {} / {} MiB, reused {}), other upload buffers alive {} ({} MiB), lists made {}, preludes {}, never-reset alive {}, retired queued {} (res {} MiB, any {})",
+            " host lists alive {}, scratch chunks alive {} ({} MiB, spare {} / {} MiB, reused {}), other upload buffers alive {} ({} MiB), deferred uploads {} ({} MiB), lists made {}, preludes {}, never-reset alive {}, retired queued {} (res {} MiB, any {})",
             alive.get(0).copied().unwrap_or(0),
             alive.get(1).copied().unwrap_or(0),
             mib(alive.get(2).copied().unwrap_or(0)),
@@ -25,6 +26,8 @@ pub fn report() -> String {
             alive.get(5).copied().unwrap_or(0),
             alive.get(6).copied().unwrap_or(0),
             mib(alive.get(7).copied().unwrap_or(0)),
+            deferred.get(0).copied().unwrap_or(0),
+            mib(deferred.get(1).copied().unwrap_or(0)),
             lists.get(0).copied().unwrap_or(0),
             lists.get(1).copied().unwrap_or(0),
             lists.get(3).copied().unwrap_or(0),
@@ -94,7 +97,10 @@ mod tests {
         assert!(line.contains("host lists alive"), "{line}");
         assert!(line.contains("scratch chunks alive"), "{line}");
         assert!(line.contains("retired queued"), "{line}");
+        assert!(line.contains("deferred uploads"), "{line}");
     }
 }
+
+
 
 

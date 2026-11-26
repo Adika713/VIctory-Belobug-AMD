@@ -1880,6 +1880,7 @@ unsafe extern "system" {
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
 static LAZY: LazyLock<Mutex<BTreeMap<usize, usize>>> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
+static HAS_LAZY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static VEH: LazyLock<bool> = LazyLock::new(|| unsafe { !AddVectoredExceptionHandler(1, Some(commit_on_demand)).is_null() });
 
 unsafe extern "system" fn commit_on_demand(info: *mut ExceptionPointers) -> i32 {
@@ -1895,6 +1896,9 @@ unsafe extern "system" fn commit_on_demand(info: *mut ExceptionPointers) -> i32 
 }
 
 fn lazy_has(page: usize) -> bool {
+    if !HAS_LAZY.load(Ordering::Relaxed) {
+        return false;
+    }
     let ranges = LAZY.lock().unwrap_or_else(|e| e.into_inner());
     ranges.range(..=page).next_back().is_some_and(|(start, end)| *start <= page && page < *end)
 }
@@ -1948,6 +1952,7 @@ fn register_lazy(base: usize, len: usize) -> bool {
         return false;
     }
     LAZY.lock().unwrap_or_else(|e| e.into_inner()).insert(base, base + len);
+    HAS_LAZY.store(true, Ordering::Release);
     true
 }
 
@@ -1967,6 +1972,7 @@ fn lazy_remove(base: usize, len: usize) {
         if start < base { ranges.insert(start, base); }
         if stop > end { ranges.insert(end, stop); }
     }
+    HAS_LAZY.store(!ranges.is_empty(), Ordering::Release);
 }
 
 /// Commits the section pages a view shows (once per page, whichever view).

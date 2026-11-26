@@ -733,6 +733,11 @@ fn create_physical_section(size: usize) -> Option<(HANDLE, Option<(std::fs::File
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let dir = std::env::var_os("VICTORY_CACHE_DIR")
             .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("LOCALAPPDATA")
+                    .map(|b| PathBuf::from(b).join("victory").join("cache"))
+            })
+            .or_else(|| std::env::var_os("TEMP").map(PathBuf::from))
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         if std::fs::create_dir_all(&dir).is_ok() {
             let path = dir.join(format!(

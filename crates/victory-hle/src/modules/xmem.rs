@@ -1943,8 +1943,9 @@ pub(crate) fn ensure_lazy_committed(base: usize, len: usize) {
             lazy_remove(rstart, len);
             page = rend;
         } else {
-            // Leave range registered so VEH or a later kernel-write retry can commit it.
-            page = rend;
+            // Leave range registered so VEH or a later retry can handle it.
+            // Stop scanning to avoid a hot loop on persistent commit failure.
+            break;
         }
     }
 }

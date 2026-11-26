@@ -486,6 +486,30 @@ pub(crate) fn staging_stats() -> [u64; 3] {
     [STAGED[0].load(Relaxed), STAGED[1].load(Relaxed), kept]
 }
 
+/// Report-only staging state scan: dirty (needs upload), never uploaded,
+/// uploaded-and-clean. Scans STAGING map; callable only.
+pub(crate) fn staging_state_stats() -> [u64; 3] {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut dirty = 0u64;
+    let mut never_uploaded = 0u64;
+    let mut clean = 0u64;
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = map.as_ref() {
+        for s in map.values() {
+            let uploaded = s.uploaded.load(Relaxed);
+            let is_dirty = s.dirty.load(Relaxed);
+            if !uploaded {
+                never_uploaded += 1;
+            } else if is_dirty {
+                dirty += 1;
+            } else {
+                clean += 1;
+            }
+        }
+    }
+    [dirty, never_uploaded, clean]
+}
+
 /// For the memory line: staging buffers alive, their bytes, and how many
 /// of them their texture still has (the others wait for a list's reset).
 #[cfg(feature = "diagnostics")]
@@ -2204,4 +2228,5 @@ mod allocation_costs {
         }
     }
 }
+
 

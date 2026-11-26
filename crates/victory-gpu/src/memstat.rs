@@ -48,13 +48,14 @@ pub fn report() -> String {
             let placed = crate::resource::placed_textures();
             let card = crate::shadow::card_memory_stats();
             let snap = crate::shadow::snapshot_active_stats();
+            let staged_state = crate::texture::staging_state_stats();
             let _ = write!(
                 line,
-                "; shadows {} ({} MiB, windows {} / {} MiB, let-go {} / {} MiB, asked-span {} MiB), snapshot pool {} ({} MiB), snapshots active host {} ({} MiB) card-before {} ({} MiB), card copies {} MiB (window {} MiB, mapped {} MiB, before {} MiB); staging {} ({} MiB, kept {})",
+                "; shadows {} ({} MiB, windows {} / {} MiB, let-go {} / {} MiB, asked-span {} MiB), snapshot pool {} ({} MiB), snapshots active host {} ({} MiB) card-before {} ({} MiB), card copies {} MiB (window {} MiB, mapped {} MiB, before {} MiB); staging {} ({} MiB, kept {}, dirty {}, never-uploaded {}, clean {})",
                 shadows[0], mib(shadows[1]), shadows[2], mib(shadows[3]), windows[0], mib(windows[1]), mib(windows[2]), shadows[4], mib(shadows[5]),
                 snap[0], mib(snap[1]), snap[2], mib(snap[3]),
                 mib(card[0]), mib(card[1]), mib(card[2]), mib(card[3]),
-                staged[0], mib(staged[1]), staged[2],
+                staged[0], mib(staged[1]), staged[2], staged_state[0], staged_state[1], staged_state[2],
             );
             let _ = write!(
                 line,
@@ -121,6 +122,7 @@ mod tests {
         assert!(line.contains("kept "), "{line}");
     }
 }
+
 
 
 

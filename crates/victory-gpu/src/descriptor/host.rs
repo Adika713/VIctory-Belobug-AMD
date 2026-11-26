@@ -1158,6 +1158,10 @@ impl TextureQueue {
             w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
             w.looks = w.looks.saturating_add(1);
             w.away = crate::host::now_ms();
+            // Clear any stale recheck fingerprint so a streamed-out or partial
+            // slot does not re-hash and log "changed after upload" on every
+            // subsequent look.
+            w.checked = (0, 0, 0, 0, 0);
         }
     }
 
@@ -1197,6 +1201,7 @@ impl TextureQueue {
     fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64) {
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
+            w.checked = (0, 0, 0, 0, 0);
         }
     }
 

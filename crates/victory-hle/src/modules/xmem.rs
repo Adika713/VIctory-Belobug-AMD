@@ -1907,27 +1907,38 @@ fn commit_fault_page(page: usize) -> bool {
 /// Ensures lazy physical pages in `[base, base+len)` are committed.
 /// Kernel-mode writes (ReadFile, DirectStorage) do not trigger the user-mode VEH.
 pub(crate) fn ensure_lazy_committed(base: usize, len: usize) {
-    if len == 0 || !lazy_physical_enabled() { return; }
+    if len == 0 || !lazy_physical_enabled() {
+        return;
+    }
     let start = base & !(PAGE - 1);
     let end = base.saturating_add(len);
     let mut page = start;
     while page < end {
-        let needs = {
+        let range = {
             let ranges = LAZY.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((&_rstart, &rend)) = ranges.range(..=page).next_back().filter(|(s, e)| **s <= page && page < **e) {
-                Some(rend.min(end))
+            if let Some((&rstart, &rend)) = ranges
+                .range(..=page)
+                .next_back()
+                .filter(|(s, e)| **s <= page && page < **e)
+            {
+                Some((page, rend.min(end)))
             } else if let Some((&rstart, &rend)) = ranges.range(page + 1..end).next() {
-                page = rstart;
-                Some(rend.min(end))
+                Some((rstart, rend.min(end)))
             } else {
                 None
             }
         };
-        let Some(rend) = needs else { break; };
-        while page < rend {
-            let _ = commit_fault_page(page);
-            page += PAGE;
+        let Some((rstart, rend)) = range else { break };
+        let mut p = rstart;
+        while p < rend {
+            let _ = commit_fault_page(p);
+            p += PAGE;
         }
+        // Remove committed pages from lazy tracking to avoid repeated VEH work.
+        // Bitmaps in Section are not updated here; later commit/window paths
+        // self-heal because VirtualAlloc(MEM_COMMIT) is idempotent.
+        lazy_remove(rstart, rend.saturating_sub(rstart));
+        page = rend;
     }
 }
 

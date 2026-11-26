@@ -2849,6 +2849,45 @@ pub(crate) fn card_memory_stats() -> [u64; 4] {
     ]
 }
 
+/// Report-only active snapshot buffers: host-copy snapshots (count, bytes),
+/// card before-twins (count, bytes). Scans live shadow sets; callable only.
+pub(crate) fn snapshot_active_stats() -> [u64; 4] {
+    let mut host_count = 0u64;
+    let mut host_bytes = 0u64;
+    let mut seen = std::collections::HashSet::new();
+    {
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        for s in loose.values() {
+            let ptr = Arc::as_ptr(s) as usize;
+            if !seen.insert(ptr) { continue; }
+            if let Some(v) = s.before.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                host_count += 1;
+                host_bytes += v.capacity() as u64;
+            }
+        }
+    }
+    let mut card_count = 0u64;
+    let mut card_bytes = 0u64;
+    {
+        let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+        carded.retain(|w| w.strong_count() > 0);
+        for s in carded.iter().filter_map(|w| w.upgrade()) {
+            let ptr = Arc::as_ptr(&s) as usize;
+            if !seen.insert(ptr) { continue; }
+            if let Some(card) = s.card.as_ref() {
+                if card.before.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+                    card_count += 1;
+                    card_bytes += card.size;
+                }
+            } else if let Some(v) = s.before.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                host_count += 1;
+                host_bytes += v.capacity() as u64;
+            }
+        }
+    }
+    [host_count, host_bytes, card_count, card_bytes]
+}
+
 /// For the memory line: host copies alive and their bytes, of them the
 /// windows of memory outside buffers and their bytes, and the snapshot
 /// buffers kept for reuse and the bytes they reserve.
@@ -5597,4 +5636,5 @@ pub(crate) fn near(va: u64) -> String {
     }
     text
 }
+
 

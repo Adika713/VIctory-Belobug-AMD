@@ -18,7 +18,7 @@ pub fn report() -> String {
         let deferred_kept = crate::host::DEFERRED_KEPT_STATS.load(Relaxed);
         let _ = write!(
             line,
-            " host lists alive {}, scratch chunks alive {} ({} MiB, spare {} / {} MiB, reused {}), other upload buffers alive {} ({} MiB), deferred uploads {} ({} MiB, kept {}), lists made {}, preludes {}, never-reset alive {}, retired queued {} (res {} MiB, any {})",
+            " host lists alive {}, scratch chunks alive {} ({} MiB, spare {} / {} MiB, reused {}), other upload buffers alive {} ({} MiB), deferred uploads {} ({} MiB, kept {}), lists made {}, preludes {}, never-reset alive {}, list-make private {} MiB, retired queued {} (res {} MiB, any {})",
             alive.get(0).copied().unwrap_or(0),
             alive.get(1).copied().unwrap_or(0),
             mib(alive.get(2).copied().unwrap_or(0)),
@@ -33,6 +33,7 @@ pub fn report() -> String {
             lists.get(0).copied().unwrap_or(0),
             lists.get(1).copied().unwrap_or(0),
             lists.get(3).copied().unwrap_or(0),
+            mib(lists.get(2).copied().unwrap_or(0)),
             retired.get(0).copied().unwrap_or(0),
             mib(retired.get(1).copied().unwrap_or(0)),
             retired.get(2).copied().unwrap_or(0),
@@ -46,10 +47,12 @@ pub fn report() -> String {
             let host_tex: Vec<u64> = crate::resource::HOST_TEXTURES.iter().map(|a| a.load(Relaxed)).collect();
             let placed = crate::resource::placed_textures();
             let card = crate::shadow::card_memory_stats();
+            let snap = crate::shadow::snapshot_active_stats();
             let _ = write!(
                 line,
-                "; shadows {} ({} MiB, windows {} / {} MiB, let-go {} / {} MiB, asked-span {} MiB), snapshot pool {} ({} MiB), card copies {} MiB (window {} MiB, mapped {} MiB, before {} MiB); staging {} ({} MiB, kept {})",
+                "; shadows {} ({} MiB, windows {} / {} MiB, let-go {} / {} MiB, asked-span {} MiB), snapshot pool {} ({} MiB), snapshots active host {} ({} MiB) card-before {} ({} MiB), card copies {} MiB (window {} MiB, mapped {} MiB, before {} MiB); staging {} ({} MiB, kept {})",
                 shadows[0], mib(shadows[1]), shadows[2], mib(shadows[3]), windows[0], mib(windows[1]), mib(windows[2]), shadows[4], mib(shadows[5]),
+                snap[0], mib(snap[1]), snap[2], mib(snap[3]),
                 mib(card[0]), mib(card[1]), mib(card[2]), mib(card[3]),
                 staged[0], mib(staged[1]), staged[2],
             );
@@ -118,6 +121,8 @@ mod tests {
         assert!(line.contains("kept "), "{line}");
     }
 }
+
+
 
 
 

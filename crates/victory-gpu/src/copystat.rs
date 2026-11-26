@@ -439,6 +439,57 @@ fn big_blocks() -> String {
     if text.is_empty() { "none".into() } else { text.join(", ") }
 }
 
+fn oom_diag(label: &str, size: usize, align: usize) {
+    // Best-effort OOM diagnostic: avoid allocations. Write to stderr via
+    // Windows API so we get *some* signal even when Rust formatting would
+    // allocate during handle_alloc_error recursion.
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+        use windows::Win32::Storage::FileSystem::WriteFile;
+        let mut buf = [0u8; 256];
+        let mut i = 0usize;
+        fn push(buf: &mut [u8; 256], i: &mut usize, b: &[u8]) {
+            let n = b.len().min(buf.len().saturating_sub(*i));
+            buf[*i..*i + n].copy_from_slice(&b[..n]);
+            *i += n;
+        }
+        fn push_u(buf: &mut [u8; 256], i: &mut usize, mut v: usize) {
+            let mut tmp = [0u8; 20];
+            let mut n = 0usize;
+            if v == 0 {
+                tmp[0] = b'0';
+                n = 1;
+            } else {
+                while v > 0 && n < tmp.len() {
+                    tmp[n] = b'0' + (v % 10) as u8;
+                    v /= 10;
+                    n += 1;
+                }
+                tmp[..n].reverse();
+            }
+            push(buf, i, &tmp[..n]);
+        }
+        push(&mut buf, &mut i, b"VICTORY_OOM ");
+        push(&mut buf, &mut i, label.as_bytes());
+        push(&mut buf, &mut i, b" size=");
+        push_u(&mut buf, &mut i, size);
+        push(&mut buf, &mut i, b" align=");
+        push_u(&mut buf, &mut i, align);
+        push(&mut buf, &mut i, b"\n");
+        let handle: HANDLE = GetStdHandle(STD_ERROR_HANDLE).unwrap_or(HANDLE(std::ptr::null_mut()));
+        if !handle.is_invalid() {
+            let mut written = 0u32;
+            let _ = WriteFile(handle, Some(&buf[..i]), Some(&mut written), None);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        eprintln!("VICTORY_OOM {label} size={size} align={align}");
+    }
+}
+
 /// The system's allocator with every block counted in [`OWN`] (two atomic
 /// additions per allocation and per release: diagnostics builds only).
 struct Counting;
@@ -452,6 +503,8 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
+        } else {
+            oom_diag("alloc", layout.size(), layout.align());
         }
         at
     }
@@ -462,6 +515,8 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
+        } else {
+            oom_diag("alloc_zeroed", layout.size(), layout.align());
         }
         at
     }
@@ -481,6 +536,8 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
             own(size, true);
             big(at, layout.size(), false);
             big(moved, size, true);
+        } else {
+            oom_diag("realloc", size, layout.align());
         }
         moved
     }

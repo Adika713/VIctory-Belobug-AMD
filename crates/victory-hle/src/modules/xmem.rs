@@ -1909,7 +1909,7 @@ pub(crate) fn ensure_lazy_committed(base: usize, len: usize) {
     while page < end {
         let needs = {
             let ranges = LAZY.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((&rstart, &rend)) = ranges.range(..=page).next_back().filter(|(s, e)| **s <= page && page < **e) {
+            if let Some((&_rstart, &rend)) = ranges.range(..=page).next_back().filter(|(s, e)| **s <= page && page < **e) {
                 Some(rend.min(end))
             } else if let Some((&rstart, &rend)) = ranges.range(page + 1..end).next() {
                 page = rstart;

@@ -1,4 +1,4 @@
-# Monitored local game test. Stops after MaxSeconds and reports measurements.
+﻿# Monitored local game test. Stops after MaxSeconds and reports measurements.
 # Hardware is the local host, not the 7900 XTX target. No pagefile change.
 param(
     [string]$GameExe = 'F:\retailgame\game_scarlett_master.exe',
@@ -182,16 +182,22 @@ if (Test-Path -LiteralPath $err) {
     $framePresented = 0
     $worldMarkers = [System.Collections.Generic.List[string]]::new()
     foreach ($line in (Get-Content -LiteralPath $err -Encoding UTF8)) {
-        $clean = [regex]::Replace($line, '\x1b\[[0-9;]*m', '')
-        # ANSI escapes can appear around '=' or values; also handle residual ESC bytes.
-        $clean = [regex]::Replace($clean, '\x1b\[[0-9;]*[A-Za-z]', '')
+        # Normalize ANSI/ESC sequences; tracing may colorize fields/values.
+        $clean = [regex]::Replace($line, '\x1b\[[0-9;]*[A-Za-z]', '')
+        $clean = [regex]::Replace($clean, '\x1b', '')
+
+        # Diagnostics frame interval log: "victory_gpu::frame ... frame=<n> interval_us=<us> ... frame interval"
         if ($clean -match 'interval_us\D*?(\d+)') {
             $intervals.Add([double]$Matches[1] / 1000.0)
-            if ($clean -match '\bframe\D*?(\d+)') { $maxFrame = [math]::Max($maxFrame, [int]$Matches[1]) }
-        }
-        if ($clean -match 'frame presented') {
             $framePresented++
-            if ($clean -match '\bframe\D*?(\d+)') { $maxFrame = [math]::Max($maxFrame, [int]$Matches[1]) }
+            if ($clean -match '\bframe(?:=|\s+)\D*?(\d+)') { $maxFrame = [math]::Max($maxFrame, [int]$Matches[1]) }
+            continue
+        }
+
+        # Legacy/fallback presented-frame markers.
+        if ($clean -match 'frame presented|presented frame') {
+            $framePresented++
+            if ($clean -match '\bframe(?:=|\s+)\D*?(\d+)') { $maxFrame = [math]::Max($maxFrame, [int]$Matches[1]) }
         }
         if ($clean -match 'mission|world loaded|loading screen|story|cutscene|gameplay|level loaded') {
             if ($worldMarkers.Count -lt 40) { $worldMarkers.Add($clean.Trim()) }
@@ -212,17 +218,24 @@ if (Test-Path -LiteralPath $err) {
     }
     $worldEntryCandidate = $false
     $worldEntryReason = 'no'
-    if ($framePresented -ge 100 -and $intervalArr.Count -ge 100) {
-        $worldEntryCandidate = $true
-        $worldEntryReason = 'sustained_frame_presentation_heuristic'
-    }
+    # Heuristic only: sustained present cadence + non-black screenshots. Never proof.
+    $nonBlack = $false
+    $maxAvg = $null; $maxMax = $null
     if ($brightness.Count -gt 0) {
         $maxAvg = ($brightness | Measure-Object avg -Maximum).Maximum
         $maxMax = ($brightness | Measure-Object max -Maximum).Maximum
-        if ($maxAvg -lt 2.0 -and $maxMax -lt 16) {
-            $worldEntryCandidate = $false
-            $worldEntryReason = 'screenshots_near_black'
-        }
+        $nonBlack = ($maxAvg -ge 2.0 -or $maxMax -ge 16)
+    }
+    $sustained = ($framePresented -ge 100 -and $intervalArr.Count -ge 100)
+    if ($sustained -and $nonBlack) {
+        $worldEntryCandidate = $true
+        $worldEntryReason = 'heuristic_sustained_present_and_nonblack_screenshots'
+    } elseif ($sustained -and $brightness.Count -gt 0 -and -not $nonBlack) {
+        $worldEntryReason = 'heuristic_rejected_screenshots_near_black'
+    } elseif ($sustained) {
+        $worldEntryReason = 'heuristic_sustained_present_no_screenshot_signal'
+    } elseif ($framePresented -gt 0 -or $intervalArr.Count -gt 0) {
+        $worldEntryReason = 'insufficient_present_samples'
     }
     $statLines = @(
         "frame_interval_count=$($intervalArr.Count)",
@@ -260,3 +273,5 @@ if ($failures.Count -gt 0) {
 
 Write-Host "summary=$summary"
 Get-Content -LiteralPath $summary -Tail 30
+
+

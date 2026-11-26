@@ -43,10 +43,12 @@ pub fn report() -> String {
             let windows = crate::shadow::windows();
             let host_tex: Vec<u64> = crate::resource::HOST_TEXTURES.iter().map(|a| a.load(Relaxed)).collect();
             let placed = crate::resource::placed_textures();
+            let card = crate::shadow::card_memory_stats();
             let _ = write!(
                 line,
-                "; shadows {} ({} MiB, windows {} / {} MiB, let-go {} / {} MiB, asked-span {} MiB), snapshot pool {} ({} MiB); staging {} ({} MiB, kept {})",
+                "; shadows {} ({} MiB, windows {} / {} MiB, let-go {} / {} MiB, asked-span {} MiB), snapshot pool {} ({} MiB), card copies {} MiB (window {} MiB, mapped {} MiB, before {} MiB); staging {} ({} MiB, kept {})",
                 shadows[0], mib(shadows[1]), shadows[2], mib(shadows[3]), windows[0], mib(windows[1]), mib(windows[2]), shadows[4], mib(shadows[5]),
+                mib(card[0]), mib(card[1]), mib(card[2]), mib(card[3]),
                 staged[0], mib(staged[1]), staged[2],
             );
             let _ = write!(
@@ -100,6 +102,7 @@ mod tests {
         assert!(line.contains("deferred uploads"), "{line}");
     }
 }
+
 
 
 

@@ -1,4 +1,4 @@
-//! Host copies of title buffers (decision 0007, step 3 and "Copies of title
+﻿//! Host copies of title buffers (decision 0007, step 3 and "Copies of title
 //! memory"). Title buffers are title memory, which the host GPU cannot
 //! read, so a buffer a draw uses gets a persistent host buffer of its size
 //! on first use (system memory shaders may also write), and the ranges each
@@ -169,11 +169,11 @@ pub(crate) fn cards() -> bool {
 /// Default `(min_mb, max_mb)` for [`card_limits`] chosen from the adapter's
 /// local VRAM budget (`DXGI_QUERY_VIDEO_MEMORY_INFO.Budget`), in bytes.
 ///
-/// - Unknown (`None`, e.g. WARP) or `<= 12 GiB` (8–12 GB cards, whose WDDM
+/// - Unknown (`None`, e.g. WARP) or `<= 12 GiB` (8â€“12 GB cards, whose WDDM
 ///   budget is below 12 GiB): `(16, 512)` MiB, matching the 12 GB baseline.
 /// - `> 12 GiB` and `< 20 GiB` (16 GB cards, whose WDDM budget is typically
-///   ~13.5–15.2 GiB): `(4, 2048)` MiB.
-/// - `>= 20 GiB` (24–32+ GB cards): `(1, (budget_mb / 4).min(8192))` MiB,
+///   ~13.5â€“15.2 GiB): `(4, 2048)` MiB.
+/// - `>= 20 GiB` (24â€“32+ GB cards): `(1, (budget_mb / 4).min(8192))` MiB,
 ///   capping at 25% of local budget (at most 8 GiB) so "before" twins (up to 2x)
 ///   still leave headroom for textures and render targets.
 fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
@@ -2838,6 +2838,17 @@ pub(crate) fn let_go_idle() {
     }
 }
 
+/// Report-only card copy memory: buffer bytes, window card bytes, mapped
+/// window bytes, before-twin bytes.
+pub(crate) fn card_memory_stats() -> [u64; 4] {
+    [
+        CARD_BYTES[0].load(Ordering::Relaxed),
+        WINDOW_CARD_BYTES.load(Ordering::Relaxed),
+        WINDOW_MAPPED_BYTES.load(Ordering::Relaxed),
+        CARD_BYTES[1].load(Ordering::Relaxed),
+    ]
+}
+
 /// For the memory line: host copies alive and their bytes, of them the
 /// windows of memory outside buffers and their bytes, and the snapshot
 /// buffers kept for reuse and the bytes they reserve.
@@ -5434,13 +5445,13 @@ mod window_tests {
         assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 512));
         assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 512));
 
-        // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5–15 GiB.
+        // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5â€“15 GiB.
         assert_eq!(default_card_limits_mb(Some(13 * GIB)), (4, 2048));
         assert_eq!(default_card_limits_mb(Some(14 * GIB)), (4, 2048));
         assert_eq!(default_card_limits_mb(Some(15 * GIB)), (4, 2048));
         assert_eq!(default_card_limits_mb(Some(16 * GIB)), (4, 2048));
 
-        // 24–32+ GB tier (>= 20 GiB): 1 MiB min, 25% of budget capped at 8192 MiB.
+        // 24â€“32+ GB tier (>= 20 GiB): 1 MiB min, 25% of budget capped at 8192 MiB.
         assert_eq!(default_card_limits_mb(Some(20 * GIB)), (1, 5120));
         assert_eq!(default_card_limits_mb(Some(24 * GIB)), (1, 6144));
         assert_eq!(default_card_limits_mb(Some(32 * GIB)), (1, 8192));
@@ -5586,3 +5597,4 @@ pub(crate) fn near(va: u64) -> String {
     }
     text
 }
+

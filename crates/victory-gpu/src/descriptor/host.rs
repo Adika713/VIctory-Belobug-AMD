@@ -1,4 +1,4 @@
-//! Host descriptor heaps behind the title's shader-visible heaps (decision
+﻿//! Host descriptor heaps behind the title's shader-visible heaps (decision
 //! 0007, step 3). Translated shaders index the heaps directly at the
 //! title's descriptor positions, so each host heap keeps the title heap's
 //! order: slot `i` is made from what the title wrote at slot `i`, when it
@@ -1330,6 +1330,21 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// The host's limit for shader-visible view heaps on resource binding
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
+/// Smaller dynamic reserve to try when the driver refuses the full heap.
+const DYNAMIC_CAPPED: u32 = 1 << 16;
+
+/// Reserves to try, largest first, when a view heap cannot be made. The
+/// title's own slots are kept in every try: shaders keep indices into them,
+/// so a heap shorter than `count` would make draws read nothing at all.
+fn dynamic_reserves(full: u32) -> Vec<u32> {
+    let mut tries = Vec::new();
+    for reserve in [full, DYNAMIC_CAPPED, 0] {
+        if reserve <= full && !tries.contains(&reserve) {
+            tries.push(reserve);
+        }
+    }
+    tries
+}
 
 /// The size of every host view heap on a host that takes more than
 /// [`PORTABLE_VIEWS`] (AMD): the title's heap (a little over 1,000,000
@@ -1467,32 +1482,63 @@ impl HostHeap {
             victory_shader::emit::view_heap_limit()
         };
         let raw = if sampler { 0 } else { victory_shader::emit::raw_views() };
-        let extra = if sampler { 0 } else { dynamic_slots(count, null) };
-        let (heap, count, size) = if null == 0 {
-            match make(count + extra) {
-                Ok(heap) => (heap, count, count + extra),
-                Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                    return None;
+        let wanted_extra = if sampler { 0 } else { dynamic_slots(count, null) };
+        let (heap, count, extra, size) = if null == 0 {
+            let mut last_error = None;
+            let mut made = None;
+            for reserve in dynamic_reserves(wanted_extra) {
+                match make(count.saturating_add(reserve)) {
+                    Ok(heap) => {
+                        made = Some((heap, reserve, count.saturating_add(reserve)));
+                        break;
+                    }
+                    Err(e) => {
+                        if reserve != 0 {
+                            tracing::warn!(error = %e, count, reserve, "host descriptor heap with this dynamic reserve failed; trying fewer slots");
+                        }
+                        last_error = Some(e);
+                    }
                 }
             }
+            let Some(made) = made else {
+                if let Some(error) = last_error {
+                    tracing::warn!(error = %error, count, sampler, "no host descriptor heap");
+                }
+                return None;
+            };
+            if made.1 < wanted_extra {
+                tracing::warn!(count, wanted = wanted_extra, made = made.1, "host descriptor heap made with a smaller dynamic reserve");
+            }
+            (made.0, count, made.1, made.2)
         } else {
             let size = if raw == 0 { null + 1 } else { 2 * raw };
-            let fitted = if count + extra <= null {
-                count
-            } else {
-                // shortcut: descriptors past the host's limit are left out; a title that reaches
-                // them needs remapping. They read the null slot instead.
-                tracing::warn!(count, "host view heap capped at {size}; views past it read a null slot");
-                null - extra
-            };
-            match make(size) {
-                Ok(heap) => (heap, fitted, size),
-                Err(e) => {
-                    tracing::warn!(error = %e, count, size, "no host view heap");
-                    return None;
+            let mut last_error = None;
+            let mut made = None;
+            for reserve in dynamic_reserves(wanted_extra) {
+                let fitted = if count + reserve <= null { count } else { null.saturating_sub(reserve) };
+                match make(size) {
+                    Ok(heap) => {
+                        made = Some((heap, fitted, reserve));
+                        break;
+                    }
+                    Err(e) => {
+                        if reserve != 0 {
+                            tracing::warn!(error = %e, count, reserve, size, "host view heap with this dynamic reserve failed; trying fewer slots");
+                        }
+                        last_error = Some(e);
+                    }
                 }
             }
+            let Some((heap, fitted, reserve)) = made else {
+                if let Some(error) = last_error {
+                    tracing::warn!(error = %error, count, size, "no host view heap");
+                }
+                return None;
+            };
+            if fitted < count || reserve < wanted_extra {
+                tracing::warn!(count, fitted, wanted = wanted_extra, made = reserve, size, "host view heap capped/fallback applied; views past limit read null slot");
+            }
+            (heap, fitted, reserve, size)
         };
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
@@ -4595,7 +4641,13 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+     #[test]
+    fn dynamic_reserves_shrink_without_dropping_title_slots() {
+        assert_eq!(dynamic_reserves(DYNAMIC), vec![DYNAMIC, DYNAMIC_CAPPED, 0]);
+        assert_eq!(dynamic_reserves(DYNAMIC_CAPPED), vec![DYNAMIC_CAPPED, 0]);
+        assert_eq!(dynamic_reserves(0), vec![0]);
+    }
+   use super::*;
 
     /// A view of a host copy that begins at a later level shows the same
     /// levels of it.
@@ -5540,3 +5592,6 @@ pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
 pub(crate) fn list_views() -> bool {
     crate::toggled!("VICTORY_LIST_VIEWS")
 }
+
+
+

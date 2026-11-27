@@ -3,7 +3,7 @@
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::{Interface, Result};
 
 use super::wire;
@@ -86,7 +86,13 @@ impl Worker {
         unsafe {
             if self.fence.GetCompletedValue() < value {
                 self.fence.SetEventOnCompletion(value, self.event)?;
-                WaitForSingleObject(self.event, INFINITE);
+                loop {
+                    let r = WaitForSingleObject(self.event, 5000);
+                    if r == windows::Win32::Foundation::WAIT_OBJECT_0 || self.fence.GetCompletedValue() >= value {
+                        break;
+                    }
+                    if self.device.GetDeviceRemovedReason().is_err() { break; }
+                }
             }
             self.device.GetDeviceRemovedReason()
         }

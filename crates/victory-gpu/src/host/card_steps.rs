@@ -655,21 +655,26 @@ impl Host {
         if stage() == 0 || !relay_exact() {
             return None;
         }
-        let (written, copies) = {
-            let line = line();
-            if line.written.is_empty() {
-                return None;
-            }
-            (line.written.clone(), copies(&line))
-        };
+        let line = line();
+        if line.written.is_empty() {
+            return None;
+        }
+        let copies = copies(&line);
         let looked = crate::timeline::span("steps on the card: whether in the way");
-        blocked_by(&written, runs, false)?;
+        let blocked = blocked_by(&line.written, runs, false).is_some();
         let read = copied_read(&copies, runs);
         looked.end();
+        if blocked {
+            drop(line);
+            return None;
+        }
         let taken = if read {
+            drop(line);
             Err("a copy done on the card is read through another host copy")
         } else {
-            self.take_steps(&written, runs)
+            let result = self.take_steps(&line.written, runs);
+            drop(line);
+            result
         };
         match taken {
             Ok(taken) => taken,

@@ -1953,7 +1953,7 @@ fn commit_fault_page(page: usize) -> CommitFault {
 /// Ensures lazy physical pages in `[base, base+len)` are committed.
 /// Kernel-mode writes (ReadFile, DirectStorage) do not trigger the user-mode VEH.
 pub(crate) fn ensure_lazy_committed(base: usize, len: usize) {
-    if len == 0 || !lazy_physical_enabled() {
+    if len == 0 || (!lazy_physical_enabled() && !HAS_LAZY.load(Ordering::Relaxed)) {
         return;
     }
     let start = base & !(PAGE - 1);

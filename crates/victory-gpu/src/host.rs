@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -316,7 +316,7 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
         a.queue.Signal(&a.fence, a.value)?;
         if a.fence.GetCompletedValue() < a.value {
             a.fence.SetEventOnCompletion(a.value, a.event)?;
-            WaitForSingleObject(a.event, INFINITE);
+            wait_for_fence_event(a.event, &a.fence, a.value, Some(&device));
         }
     }
     let us = started.elapsed().as_micros() as u64;
@@ -789,6 +789,29 @@ fn stood(since: std::time::Instant) {
     CARD_CLOCK_US[2].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
+/// Wait for a fence event, but don't hang forever on device loss/stalls.
+/// At 2-5fps or TDR, INFINITE waits can deadlock progress; poll and bail if
+/// the device is removed or the fence already reached the target.
+fn wait_for_fence_event(event: HANDLE, fence: &ID3D12Fence, target: u64, device: Option<&ID3D12Device>) {
+    loop {
+        // SAFETY: event handle is valid for this wait.
+        let r = unsafe { WaitForSingleObject(event, 5000) };
+        if r == WAIT_OBJECT_0 {
+            return;
+        }
+        // SAFETY: plain query.
+        if unsafe { fence.GetCompletedValue() } >= target {
+            return;
+        }
+        if let Some(device) = device {
+            // SAFETY: plain query.
+            if unsafe { device.GetDeviceRemovedReason() }.is_err() {
+                return;
+            }
+        }
+    }
+}
+
 /// What [`CARD_CLOCK_US`] is measured with.
 struct CardClock {
     fence: ID3D12Fence,
@@ -822,7 +845,7 @@ fn card_clock_watch(clock: &'static CardClock) {
         // SAFETY: the clock's fence and this thread's event.
         unsafe {
             if clock.fence.SetEventOnCompletion(target, event).is_ok() {
-                WaitForSingleObject(event, INFINITE);
+                wait_for_fence_event(event, &clock.fence, target, None);
             }
         }
         seen = target;
@@ -3481,7 +3504,7 @@ fn late_helper() {
             if host.fence.SetEventOnCompletion(target, event).is_ok() {
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(Some(target));
-                WaitForSingleObject(event, INFINITE);
+                wait_for_fence_event(event, &host.fence, target, Some(&host.device));
             }
         }
         {
@@ -3643,7 +3666,7 @@ fn relay_worker() {
                 // SAFETY: the host's fence and this thread's event.
                 let waited = unsafe {
                     host.fence.SetEventOnCompletion(target, event).map(|()| {
-                        WaitForSingleObject(event, INFINITE);
+                        wait_for_fence_event(event, &host.fence, target, Some(&host.device));
                     })
                 };
                 if waited.is_err() {
@@ -4979,7 +5002,7 @@ impl Host {
                     fence.SetEventOnCompletion(sent, event)?;
                     #[cfg(feature = "diagnostics")]
                     let _card = crate::timeline::card_wait(None);
-                    WaitForSingleObject(event, INFINITE);
+                    wait_for_fence_event(event, &fence, sent, Some(&self.device));
                     return Ok(behind);
                 }
                 // In the order of the queue: the sends of title bytes so
@@ -4994,7 +5017,7 @@ impl Host {
                 fence.SetEventOnCompletion(sent, event)?;
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(None);
-                WaitForSingleObject(event, INFINITE);
+                wait_for_fence_event(event, &fence, sent, Some(&self.device));
                 Ok(after)
             })()
         };
@@ -5285,7 +5308,7 @@ impl Host {
                     self.queue.Signal(&self.fence, *submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
-                    WaitForSingleObject(self.event, INFINITE);
+                    wait_for_fence_event(self.event, &self.fence, *submitted, Some(&self.device));
                     stood(waiting);
                     working(was_working);
                     Ok(())
@@ -5554,7 +5577,7 @@ impl Host {
                             working(false);
                             #[cfg(feature = "diagnostics")]
                             let _card = crate::timeline::card_wait(Some(*submitted));
-                            WaitForSingleObject(self.event, INFINITE);
+                            wait_for_fence_event(self.event, &self.fence, *submitted, Some(&self.device));
                             stood(waiting);
                             working(true);
                         }
@@ -6039,7 +6062,7 @@ impl Host {
                         working(false);
                         #[cfg(feature = "diagnostics")]
                         let _card = crate::timeline::card_wait(Some(*submitted));
-                        WaitForSingleObject(self.event, INFINITE);
+                        wait_for_fence_event(self.event, &self.fence, *submitted, Some(&self.device));
                         stood(started);
                         working(true);
                     }

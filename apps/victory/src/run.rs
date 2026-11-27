@@ -84,13 +84,9 @@ pub fn run(
         // Select the provider before the first lookup builds the import registry.
         victory_hle::modules::fidelityfx::use_host_dir(dir)
             .map_err(anyhow::Error::msg)
-<<<<<<< HEAD
-            .with_context(|| format!("loading FSR 4.1.2 from {}", dir.display()))?;
-=======
             .with_context(|| format!("loading the PC FSR upscaler from {}", dir.display()))?;
     }
     let image = if let Some(preset) = fsr {
->>>>>>> c04b792b (fix(victory): allow PC FidelityFX at the title resolution (#438))
         // SAFETY: Windows supports setting the environment across threads.
         // No title code has run or queried DXGI yet.
         unsafe { std::env::set_var("VICTORY_DISPLAY_MODE", "3840x2160") };

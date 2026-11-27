@@ -330,19 +330,13 @@ fn select_version(query_fn: Call, device: &ID3D12Device) -> Result<(u64, String)
             "upscaler version names could not be queried (code {code})"
         ));
     }
-    let mut available = Vec::new();
+    let mut offered = Vec::new();
     for (id, name) in ids.into_iter().zip(names).take(count as usize) {
         if !name.is_null() {
             // SAFETY: NUL-terminated name owned by the SDK.
             let name = unsafe { CStr::from_ptr(name) }
                 .to_string_lossy()
                 .into_owned();
-<<<<<<< HEAD
-            if is_fsr_4_1_2(&name) {
-                return Ok((id, name));
-            }
-            available.push(name);
-=======
             offered.push((id, name));
         }
     }

@@ -840,7 +840,13 @@ void main() {
                 self.fence
                     .SetEventOnCompletion(self.submitted, self.event)
                     .unwrap();
-                WaitForSingleObject(self.event, INFINITE);
+                loop {
+                    let r = WaitForSingleObject(self.event, 5000);
+                    if r == windows::Win32::Foundation::WAIT_OBJECT_0 || self.fence.GetCompletedValue() >= self.submitted {
+                        break;
+                    }
+                    if self.device.GetDeviceRemovedReason().is_err() { break; }
+                }
                 self.allocator.Reset().unwrap();
                 self.list.Reset(&self.allocator, None).unwrap();
             }
@@ -3759,7 +3765,13 @@ void work() {
                 self.queue.ExecuteCommandLists(&[Some(run)]);
                 self.queue.Signal(&self.fence, self.submitted).unwrap();
                 self.fence.SetEventOnCompletion(self.submitted, self.event).unwrap();
-                WaitForSingleObject(self.event, INFINITE);
+                loop {
+                    let r = WaitForSingleObject(self.event, 5000);
+                    if r == windows::Win32::Foundation::WAIT_OBJECT_0 || self.fence.GetCompletedValue() >= self.submitted {
+                        break;
+                    }
+                    if self.device.GetDeviceRemovedReason().is_err() { break; }
+                }
                 self.allocator.Reset().unwrap();
                 self.list.Reset(&self.allocator, None).unwrap();
             }

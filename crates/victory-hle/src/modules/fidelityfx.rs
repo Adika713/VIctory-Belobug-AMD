@@ -337,16 +337,48 @@ fn select_version(query_fn: Call, device: &ID3D12Device) -> Result<(u64, String)
             let name = unsafe { CStr::from_ptr(name) }
                 .to_string_lossy()
                 .into_owned();
+<<<<<<< HEAD
             if is_fsr_4_1_2(&name) {
                 return Ok((id, name));
             }
             available.push(name);
+=======
+            offered.push((id, name));
         }
     }
-    Err(format!(
-        "no FSR 4.1.2 provider for this adapter (available: {})",
-        available.join(", ")
-    ))
+    choose(offered)
+}
+
+/// The patch number of an FSR 3.1 provider's name (`3.1.5` → 5); `None` for
+/// any other version (`3.10.0`, `2.3.4`, `4.1.2`).
+fn fsr_3_1_patch(name: &str) -> Option<u32> {
+    let patch = name.strip_prefix("3.1.")?;
+    let digits = patch.len() - patch.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    patch[..digits].parse().ok()
+}
+
+/// The provider to ask for, of those the SDK offers for the adapter: FSR
+/// 4.1.2 where there is one, otherwise the newest FSR 3.1 (which runs on any
+/// D3D12 card; AMD offers 4 on few). With neither, what was offered is said.
+fn choose(offered: Vec<(u64, String)>) -> Result<(u64, String), String> {
+    if let Some(at) = offered.iter().position(|(_, name)| is_fsr_4_1_2(name)) {
+        return Ok(offered.into_iter().nth(at).unwrap());
+    }
+    let newest = offered
+        .iter()
+        .enumerate()
+        .filter_map(|(at, (_, name))| fsr_3_1_patch(name).map(|patch| (patch, at)))
+        .max_by_key(|&(patch, _)| patch);
+    match newest {
+        Some((_, at)) => Ok(offered.into_iter().nth(at).unwrap()),
+        None => {
+            let names: Vec<&str> = offered.iter().map(|(_, name)| name.as_str()).collect();
+            Err(format!(
+                "the SDK offers this adapter neither FSR 4.1.2 nor FSR 3.1 (offered: {}); run without VICTORY_PC_FSR or -Fsr4K (VICTORY_FSR_4K)",
+                if names.is_empty() { "nothing".into() } else { names.join(", ") }
+            ))
+        }
+    }
 }
 
 /// Puts the host backend after the title's upscaler description, in place

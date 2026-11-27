@@ -3472,14 +3472,20 @@ impl Shadow {
         if self.place.is_some() {
             return 0;
         }
+        let (from, to) = self.inside(address, len);
+        self.compared(from, to);
+        if from >= to {
+            return 0;
+        }
+        // `find_all` already proved no pieces differ: skip the snapshot lock
+        // and title-memory reads. Many declared ranges are clean each frame.
+        if matches!(found.as_ref(), Some(f) if f.is_empty()) {
+            return 0;
+        }
         let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
-        let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        self.compared(from, to);
-        if let Some(before) = &*snapshot
-            && from < to
-        {
+        if let Some(before) = &*snapshot {
             // SAFETY: `writing` set the snapshot's bytes of every declared
             // range, at the copy's offsets.
             let before = unsafe { std::slice::from_raw_parts(before.as_ptr().add(from), to - from) };

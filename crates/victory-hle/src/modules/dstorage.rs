@@ -594,6 +594,7 @@ struct Job {
     request: Request,
     note: Note,
     staging: u64,
+    source_file: Option<FileRef>,
 }
 
 // SAFETY: as for `Lane`.
@@ -775,7 +776,7 @@ pub(crate) mod stream_log {
 fn work(scheduler: &'static Scheduler) {
     let mut lanes = scheduler.lock();
     loop {
-        let Some(job) = lanes.start() else {
+        let Some(mut job) = lanes.start() else {
             lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
             continue;
         };
@@ -790,6 +791,9 @@ fn work(scheduler: &'static Scheduler) {
         if let Some(traced) = traced {
             traced.end(&job, &result);
         }
+        // Release the source outside the scheduler lock and before a status
+        // can tell the title that the read has completed.
+        drop(job.source_file.take());
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -845,14 +849,13 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, Read { request, note }) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
+        let staging = staging_bytes(&lane.reads.front()?.1.request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        let (seq, Read { request, note, source_file }) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
@@ -866,6 +869,7 @@ impl Lanes {
             request,
             note,
             staging,
+            source_file,
         })
     }
 
@@ -1040,10 +1044,33 @@ enum Command {
 }
 
 /// An enqueued request, and what the trace knows of it.
-#[derive(Clone, Copy)]
 struct Read {
     request: Request,
     note: Note,
+    source_file: Option<FileRef>,
+}
+
+/// Keeps a file open from enqueue until the worker finishes or the read is cancelled.
+struct FileRef(*mut Instance<File>);
+
+impl FileRef {
+    fn retain_for(request: &Request) -> Option<Self> {
+        if request.options & MEMORY_SOURCE != 0 {
+            return None;
+        }
+        if request.source.is_null() || request.destination.is_null() {
+            return None;
+        }
+        let file = request.source.cast_mut().cast::<Instance<File>>();
+        add_ref_instance(file);
+        Some(Self(file))
+    }
+}
+
+impl Drop for FileRef {
+    fn drop(&mut self) {
+        release(self.0);
+    }
 }
 
 /// The streaming trace (`VICTORY_DSTORAGE_TRACE`): 0 or unset: off; 1: a
@@ -1270,7 +1297,8 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
         return;
     };
     let note = Note::enqueued(&request);
-    queue(this, Command::Read(Read { request, note }));
+    let source_file = FileRef::retain_for(&request);
+    queue(this, Command::Read(Read { request, note, source_file }));
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -2229,7 +2257,8 @@ mod tests {
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
         let note = Note::default();
-        lane.unsubmitted.push(Command::Read(Read { request: r, note }));
+        let source_file = FileRef::retain_for(&r);
+        lane.unsubmitted.push(Command::Read(Read { request: r, note, source_file }));
     }
 
     #[test]

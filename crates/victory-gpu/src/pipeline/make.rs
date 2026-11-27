@@ -264,7 +264,6 @@ unsafe extern "system" fn compiler_crashed(
 
 /// The thread that deals with the workers the compiler crashed under.
 fn watch() {
-    use windows_sys::Win32::System::Threading::WaitForSingleObject;
     loop {
         let event = CRASH_EVENT.load(Ordering::Acquire);
         // SAFETY: the event lives as long as the process.

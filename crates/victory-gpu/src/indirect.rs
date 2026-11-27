@@ -3770,7 +3770,6 @@ void work() {
                     if r == windows::Win32::Foundation::WAIT_OBJECT_0 || self.fence.GetCompletedValue() >= self.submitted {
                         break;
                     }
-                    if self.device.GetDeviceRemovedReason().is_err() { break; }
                 }
                 self.allocator.Reset().unwrap();
                 self.list.Reset(&self.allocator, None).unwrap();

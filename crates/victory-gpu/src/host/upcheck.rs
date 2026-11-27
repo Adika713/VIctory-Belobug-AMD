@@ -502,7 +502,16 @@ fn run(host: &Host, f: impl FnOnce(&ID3D12GraphicsCommandList)) -> Option<()> {
         host.queue.ExecuteCommandLists(&[Some(list.cast().ok()?)]);
         let done = host.queue.Signal(&fence, 1).and_then(|()| fence.SetEventOnCompletion(1, event));
         if done.is_ok() {
-            WaitForSingleObject(event, INFINITE);
+            loop {
+                // SAFETY: event handle valid.
+                let r = WaitForSingleObject(event, 5000);
+                if r == windows::Win32::Foundation::WAIT_OBJECT_0 || fence.GetCompletedValue() >= 1 {
+                    break;
+                }
+                if host.device.GetDeviceRemovedReason().is_err() {
+                    break;
+                }
+            }
         }
         let _ = CloseHandle(event);
         done.ok()

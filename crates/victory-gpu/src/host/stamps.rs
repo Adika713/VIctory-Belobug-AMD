@@ -173,7 +173,13 @@ mod tests {
                 host.queue.ExecuteCommandLists(&[Some(ahead), Some(behind)]);
                 host.queue.Signal(&host.fence, *submitted).unwrap();
                 host.fence.SetEventOnCompletion(*submitted, host.event).unwrap();
-                WaitForSingleObject(host.event, INFINITE);
+                loop {
+                    let r = WaitForSingleObject(host.event, 5000);
+                    if r == windows::Win32::Foundation::WAIT_OBJECT_0 || host.fence.GetCompletedValue() >= *submitted {
+                        break;
+                    }
+                    if host.device.GetDeviceRemovedReason().is_err() { break; }
+                }
             }
         }
         let done = crate::timeline::ticks();

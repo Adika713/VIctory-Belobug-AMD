@@ -777,6 +777,7 @@ fn drained() {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            queued_at_creation = EAGER.load(Ordering::Relaxed),
             "host pipelines all made"
         );
     }

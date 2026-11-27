@@ -18,12 +18,8 @@ use std::time::Duration;
 
 use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D12::*;
-<<<<<<< HEAD
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
-=======
 use windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
->>>>>>> 24d2dbb6 (fix(gpu): handle device removal in the keep-awake fence)
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::Interface;
 
 /// About 2 ms at full clocks: 500 sends a second.

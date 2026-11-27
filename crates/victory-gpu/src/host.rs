@@ -601,11 +601,12 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
 }
 
 /// How many submissions later than it could (the last one that may use it
-/// has finished) an object let go is dropped, and a host list that has run
-/// is reset, about two frames: the device losses of the night of 2026-11-25
-/// were page faults in memory nothing of ours named any more, at no command
-/// in particular. Objects let go while nothing runs wait as well: lists
-/// recorded and not yet sent may name them. `VICTORY_BURY_LAG=0`: not.
+/// has finished) an object let go is dropped, about two frames: the device
+/// losses of the night of 2026-11-25 were page faults in memory nothing of
+/// ours named any more, at no command in particular. Objects let go while
+/// nothing runs wait as well: lists recorded and not yet sent may name
+/// them. What a host list that ran sent ahead held waits the same
+/// ([`land`]). `VICTORY_BURY_LAG=0`: not.
 fn bury_lag() -> u64 {
     static LAG: OnceLock<u64> = OnceLock::new();
     *LAG.get_or_init(|| {
@@ -1113,6 +1114,9 @@ fn create() -> windows::core::Result<Host> {
                 "host D3D12 adapter"
             );
         }
+        if let Some(adapter) = adapter.as_ref() {
+            segments::log(adapter);
+        }
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -1370,9 +1374,10 @@ pub(crate) struct HostList {
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
-    /// The list that runs those transitions just before this one, made
-    /// when the list first has such transitions ([`lazy_prelude`]).
-    prelude: OnceLock<Option<Prelude>>,
+    /// The list that runs those transitions just before this one, taken
+    /// when the list is first submitted with such transitions and given
+    /// back at its reset ([`take_prelude`], [`lazy_prelude`]).
+    prelude: Mutex<Option<Prelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: std::sync::Arc<Mutex<std::collections::BTreeSet<String>>>,
     /// What its indirect executions ran, for the report of a removed device.
@@ -1414,6 +1419,50 @@ pub(crate) struct HostList {
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 
+/// A prelude in [`PRELUDES`].
+struct IdlePrelude(Prelude);
+
+// SAFETY: D3D12 objects (free-threaded), touched by nobody while idle.
+unsafe impl Send for IdlePrelude {}
+
+/// Preludes of host lists that ran ([`HostList::reset`]), for the next list
+/// that needs one. Kept by its list for the list's life, a prelude held its
+/// allocator's command memory while the list sat idle or recorded: 952 for
+/// 1,476 host lists, near 1 GB of a 2 GB aperture segment on an RX 6700 XT
+/// (`FINDINGS-6700XT.md`), where only lists being submitted or in the air
+/// need one.
+static PRELUDES: Mutex<Vec<IdlePrelude>> = Mutex::new(Vec::new());
+
+/// The most preludes kept idle, and while an aperture segment of the card's
+/// memory is near its limit ([`trim_preludes`]).
+const PRELUDES_MOST: (usize, usize) = (128, 16);
+
+/// A prelude for a list about to be submitted: an idle one, or a new one.
+fn take_prelude() -> Option<Prelude> {
+    let idle = PRELUDES.lock().unwrap_or_else(|e| e.into_inner()).pop();
+    idle.map(|IdlePrelude(prelude)| prelude).or_else(|| host().and_then(|h| h.make_prelude()))
+}
+
+/// Keeps `prelude`, whose submission has finished, for [`take_prelude`].
+fn give_prelude(prelude: Prelude) {
+    let mut idle = PRELUDES.lock().unwrap_or_else(|e| e.into_inner());
+    if idle.len() < PRELUDES_MOST.0 {
+        idle.push(IdlePrelude(prelude));
+    }
+}
+
+/// Lets idle preludes past [`PRELUDES_MOST`]'s second number go, and their
+/// command memory with them.
+pub(crate) fn trim_preludes() {
+    let gone: Vec<IdlePrelude> = {
+        let mut idle = PRELUDES.lock().unwrap_or_else(|e| e.into_inner());
+        let keep = idle.len().min(PRELUDES_MOST.1);
+        idle.split_off(keep)
+    };
+    // (Outside the lock: freeing lists takes the graphics kernel's time.)
+    drop(gone);
+}
+
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
 /// it; lists that name no texture never have one, and every host list was
@@ -1437,6 +1486,15 @@ type States = std::collections::HashMap<
     usize,
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
+
+/// What a host list that ran still held for its commands
+/// ([`HostList::take_held`]), kept through [`retire`].
+pub(crate) struct Held {
+    _deferred: Deferred,
+    _states: States,
+    _twins: std::collections::HashMap<usize, TwinUse>,
+    _coming: Option<(usize, std::sync::Arc<aside::Coming>)>,
+}
 
 /// What a list does with a depth texture that has a colour twin
 /// ([`crate::resource::Twin`]). Lists are recorded on many threads and run
@@ -3474,15 +3532,13 @@ pub(crate) fn settle_for_fence() {
 }
 
 /// Resets the host lists of settled flights and keeps them for reuse, as
-/// a queue does for the lists it ran (`crate::list::recycle`).
+/// a queue does for the lists it ran (`crate::list::recycle_landed`): what
+/// their commands named waits [`bury_lag`] submissions more ([`retire`]);
+/// the lists and their allocators are used again at once.
 fn land() {
-    let landed: Vec<_> = {
-        let mut line = line();
-        let n = line.landed.len().saturating_sub(bury_lag() as usize);
-        line.landed.drain(..n).collect()
-    };
+    let landed = std::mem::take(&mut line().landed);
     for (lists, order) in landed {
-        crate::list::recycle(lists, &order);
+        crate::list::recycle_landed(lists, &order);
     }
 }
 
@@ -3935,6 +3991,7 @@ pub(crate) mod indirects;
 mod panel;
 mod place;
 pub(crate) mod rec;
+mod segments;
 mod send;
 mod upq;
 pub(crate) use send::{goes_as_words, words_under};
@@ -4314,10 +4371,7 @@ impl Host {
                 &allocator,
                 None,
             )?;
-            let prelude = OnceLock::new();
-            if !lazy_prelude() {
-                let _ = prelude.set(self.make_prelude());
-            }
+            let prelude = Mutex::new(if lazy_prelude() { None } else { self.make_prelude() });
             #[cfg(feature = "diagnostics")]
             let notes = std::sync::Arc::<Mutex<Vec<Note>>>::default();
             let pipelines = std::sync::Arc::<Mutex<std::collections::BTreeSet<String>>>::default();
@@ -5485,10 +5539,20 @@ impl Host {
         };
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
         RELAY_MOVED.notify_one();
+        // An aperture segment near its limit: every flight lands before the
+        // next is sent, as without sending ahead, and idle host lists past a
+        // few go, their command memory with them ([`segments`]).
+        let tight = self.adapter.as_ref().is_some_and(segments::tight);
+        if tight {
+            crate::list::trim_idle();
+            trim_preludes();
+        }
         if told && !late_writes() {
             self.settle(&mut submitted, WHY_WRITES);
         } else if sizes {
             self.settle(&mut submitted, WHY_READ);
+        } else if tight {
+            self.settle(&mut submitted, WHY_MOST);
         } else if most && relay_exact() {
             // Until there are fewer, not until there are none.
             relay_wait(WHY_MOST, |line| line.lists < late_most());
@@ -6634,6 +6698,11 @@ impl HostList {
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
         self._alive.used();
+        // Every submission of the list has run, its prelude's too.
+        let prelude = self.prelude.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(prelude) = prelude {
+            give_prelude(prelude);
+        }
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let texture_backs = {
             let mut deferred = self.deferred();
@@ -6681,6 +6750,20 @@ impl HostList {
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+    }
+
+    /// What the list holds for the commands it recorded: its deferred work,
+    /// the host textures and twins it names, the refreshes still being
+    /// found. Taken out to be kept through [`retire`] while the list itself
+    /// is reset and used again ([`land`]); [`HostList::reset`] then finds
+    /// them empty.
+    pub(crate) fn take_held(&self) -> Held {
+        Held {
+            _deferred: std::mem::take(&mut *self.deferred()),
+            _states: std::mem::take(&mut *self.states.lock().unwrap_or_else(|e| e.into_inner())),
+            _twins: std::mem::take(&mut *self.twins.lock().unwrap_or_else(|e| e.into_inner())),
+            _coming: self.coming.lock().unwrap_or_else(|e| e.into_inner()).take(),
+        }
     }
 
     /// Something changed in this list that bringing a draw's textures and
@@ -7062,11 +7145,11 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() && uploads.is_empty() {
             return None;
         }
-        let Some((allocator, list)) = self
-            .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
-            .as_ref()
-        else {
+        let mut held = self.prelude.lock().unwrap_or_else(|e| e.into_inner());
+        if held.is_none() {
+            *held = take_prelude();
+        }
+        let Some((allocator, list)) = held.as_ref() else {
             fail(format_args!("no host list for a state prelude"));
         };
         // SAFETY: the prelude is not executing (every submission is waited

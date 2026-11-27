@@ -1942,7 +1942,7 @@ pub(crate) fn copy_state(this: This) -> Option<(u8, u64, u64)> {
     let memory = r.data() as u64;
     let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
     Some(match made.as_ref() {
-        Some((host, _)) => (2, host.bytes, memory),
+        Some((host, _)) => (2, host.backing_bytes(), memory),
         None => (u8::from(r.host.gone.load(Relaxed)), footprint(&r.desc).map_or(0, |f| f.size), memory),
     })
 }
@@ -2331,7 +2331,7 @@ pub(crate) fn targets_census() -> [u64; 12] {
         if host.filled && !copied_into {
             continue;
         }
-        let bytes = host.bytes + twin.as_ref().map_or(0, |t| t.colour.bytes);
+        let bytes = host.backing_bytes() + twin.as_ref().map_or(0, |t| t.colour.bytes);
         let mut add = |i: usize| {
             c[i] += 1;
             c[i + 1] += bytes;
@@ -2389,7 +2389,8 @@ pub(crate) fn census() -> [u64; 10] {
             Some((host, twin)) => {
                 let kind = if host.filled { 4 } else { 0 };
                 count[kind] += 1;
-                count[kind + 1] += host.bytes + twin.as_ref().map_or(0, |t| t.colour.bytes);
+                let host_bytes = host.backing_bytes();
+                count[kind + 1] += host_bytes + twin.as_ref().map_or(0, |t| t.colour.bytes);
                 count[7] += twin.as_ref().map_or(0, |t| t.colour.bytes);
                 let placed = r.host.placed.load(std::sync::atomic::Ordering::Relaxed);
                 if placed {
@@ -2400,9 +2401,9 @@ pub(crate) fn census() -> [u64; 10] {
                     // Its first page: a texture's smallest mips lie there,
                     // and are mapped first and unmapped last.
                     if placed_filled.is_multiple_of(EVERY) && !crate::texture::committed(r.data().cast_const(), 1) {
-                        count[8] += host.bytes * EVERY;
+                        count[8] += host_bytes * EVERY;
                         if crate::host::references(&host.texture) > 1 {
-                            count[9] += host.bytes * EVERY;
+                            count[9] += host_bytes * EVERY;
                         }
                     }
                 }

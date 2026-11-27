@@ -583,6 +583,14 @@ pub(crate) fn lock_waits(frames: f64) -> String {
 /// Taken before the journal's lock, never under it.
 static ASKING: (Mutex<Vec<(usize, usize)>>, Condvar) = (Mutex::new(Vec::new()), Condvar::new());
 
+/// Taken by every test that stands a submission's one asking ([`ask_once`]
+/// or [`ask_ahead`] with [`ask_rest`], to [`ask_once_end`]). The asking is
+/// the process's and one thread submits in the runtime, but `cargo test`
+/// runs tests side by side: one test's `ask_once_end` ended another's
+/// asking mid-round (Belobug/VIctory-Belobug-AMD#534).
+#[cfg(test)]
+pub(crate) static STANDING_IN_TEST: Mutex<()> = Mutex::new(());
+
 /// Pages `[first, last)` held in [`ASKING`] until dropped.
 struct Asking(usize, usize);
 
@@ -4332,6 +4340,7 @@ mod tests {
     /// copied.
     #[test]
     fn the_rest_of_the_one_asking_has_a_number_of_its_own() {
+        let _one = STANDING_IN_TEST.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
             VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
@@ -5830,6 +5839,7 @@ mod port7_tests {
     /// before asking is told of that write.
     #[test]
     fn no_write_is_lost_with_port_7() {
+        let _one = STANDING_IN_TEST.lock().unwrap_or_else(|e| e.into_inner());
         askers_and_a_submission(1);
         askers_and_a_submission(2);
     }

@@ -2592,9 +2592,21 @@ impl State {
                 && !baking
                 && crate::descriptor::host::show_after()
                 && heap.handle(index).is_some_and(|handle| !host.texture_slot_made_from(index, handle));
-            let view = heap.handle(index).and_then(|handle| {
-                if shows_other || late { crate::descriptor::view(handle) } else { host.mirror(index, handle, true) }
+            let (held, _held_key): (Option<View>, Option<u64>) = heap.handle(index).map_or((None, None), |handle| {
+                // The view read at the start of this slot's turn: reuse it for
+                // late/show-other slots instead of reading the views table again.
+                if late {
+                    let view = crate::descriptor::view(handle);
+                    (view, None)
+                } else if shows_other {
+                    let view = crate::descriptor::view(handle);
+                    (view, None)
+                } else {
+                    let view = host.mirror(index, handle, true);
+                    (view, None)
+                }
             });
+            let view = held.clone();
             let at_once = || {
                 if late && let Some(handle) = heap.handle(index) {
                     let _ = host.mirror(index, handle, true);

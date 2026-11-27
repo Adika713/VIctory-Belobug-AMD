@@ -2930,15 +2930,27 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
 /// `ranges` with `more`, in order, joined where they overlap or touch.
 fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = (usize, usize)>) {
     ranges.extend(more.into_iter().filter(|r| r.0 < r.1));
+    if ranges.len() <= 1 {
+        return;
+    }
     ranges.sort_unstable();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for &(from, to) in ranges.iter() {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    let mut write = 0usize;
+    for read in 0..ranges.len() {
+        let (from, to) = ranges[read];
+        if write == 0 {
+            ranges[0] = (from, to);
+            write = 1;
+            continue;
+        }
+        let last = &mut ranges[write - 1];
+        if from <= last.1 {
+            last.1 = last.1.max(to);
+        } else {
+            ranges[write] = (from, to);
+            write += 1;
         }
     }
-    *ranges = out;
+    ranges.truncate(write);
 }
 
 /// Whether anything is in the air.

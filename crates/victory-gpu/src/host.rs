@@ -2957,14 +2957,15 @@ fn flying() -> bool {
 /// runs steps of ours that may read or write it anywhere; what the
 /// flights' shaders write is not there yet.
 fn late_blocked(runs: &[&HostList]) -> Option<usize> {
-    let (written, copies) = {
-        let line = line();
-        if line.written.is_empty() {
-            return None;
-        }
-        (line.written.clone(), card_steps::copies(&line))
-    };
-    blocked_by(&written, runs, true).or_else(|| card_steps::copied_read(&copies, runs).then_some(WHY_READ))
+    let line = line();
+    if line.written.is_empty() {
+        return None;
+    }
+    let copies = card_steps::copies(&line);
+    let blocked = blocked_by(&line.written, runs, true)
+        .or_else(|| card_steps::copied_read(&copies, runs).then_some(WHY_READ));
+    drop(line);
+    blocked
 }
 
 /// Whether a small fill of upload memory, or copy of a title buffer, goes on without waiting for

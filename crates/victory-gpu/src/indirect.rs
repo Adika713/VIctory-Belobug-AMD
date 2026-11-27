@@ -634,7 +634,7 @@ pub(crate) mod tests {
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
     use windows::Win32::Graphics::Dxgi::*;
-    use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
     use windows::core::Interface;
 
     const WORKER_CS: &str = r#"
@@ -3348,7 +3348,7 @@ mod bare_cost {
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::*;
     use windows::Win32::Graphics::Dxgi::*;
-    use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
     use windows::core::{Interface, s};
 
     use crate::host::{compile, transition};

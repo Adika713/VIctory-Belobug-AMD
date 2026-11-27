@@ -1,4 +1,4 @@
-# VIctory on an RX 7900 XTX
+﻿# VIctory on an RX 7900 XTX
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
 that runs an Xbox Series title natively on Windows from files the user supplies.
@@ -57,7 +57,7 @@ the frame now is the one thread that submits the title's work to the card
 | `VICTORY_OUTPUT=1920x1080` | The title renders to that output size itself (Series X profile; about 16 ms less card time) |
 | `VICTORY_FRAME_INTERVAL_MS=16.667` | Lets the title go above 30 fps (menus and videos reach 60; the game's clock stays right) |
 | `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
-| `VICTORY_TEXTURE_STORE=1` | Converted textures kept between runs (about 8 ms a frame for now: off) |
+| `VICTORY_TEXTURE_STORE=1` | Keep converted textures in the configured cache's `textures` folder (off by default). For a custom folder, set `VICTORY_TEXTURE_STORE` to a path outside the source tree. |
 
 What is known to be wrong:
 
@@ -97,9 +97,9 @@ while keeping the current console profile and its resolution settings. The
 title must choose FidelityFX to use it. Set `VICTORY_UPSCALER=7` where that
 selector is supported. The title's default render scale is a starting point.
 
-`scripts\play.ps1 -Exe <path> -Fsr4K quality` selects 2560×1440 input for
-the retail 1.0.2.1 Series X 4K SDR profile. `balanced` selects 2258×1270
-and `performance` selects 1920×1080. All three output 3840×2160. With
+`scripts\play.ps1 -Exe <path> -Fsr4K quality` selects 2560Ă—1440 input for
+the retail 1.0.2.1 Series X 4K SDR profile. `balanced` selects 2258Ă—1270
+and `performance` selects 1920Ă—1080. All three output 3840Ă—2160. With
 `victory run` directly, set `VICTORY_FSR_4K` to the preset name.
 The log reports the provider at context creation and the actual input and
 output sizes at the first successful temporal dispatch. The title profile

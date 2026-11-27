@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -69,8 +69,9 @@ fn book() -> Option<&'static Recorder> {
         let mut shaders = HashSet::new();
         let ends = [
             walk_shaders(&dir, |_, hash, _, _| { let _ = shaders.insert(hash); }),
-            walk_pipelines(&dir, |_, bytes| {
-                keys.extend(bytes.first_chunk::<16>().copied());
+            walk_pipelines(&dir, |_, size, entry| {
+                keys.extend(read_pipeline_key(size, entry)?);
+                Ok(())
             }),
         ];
         for (file, end) in [SHADERS, PIPELINES].iter().zip(ends) {
@@ -216,32 +217,63 @@ fn walk_shaders(dir: &Path, mut f: impl FnMut(u8, [u8; 32], u64, u32)) -> u64 {
     at
 }
 
-/// Calls `f` with each pipeline's number and entry; where the last whole one
-/// ends.
-fn walk_pipelines(dir: &Path, mut f: impl FnMut(usize, &[u8])) -> u64 {
-    let bytes = std::fs::read(dir.join(PIPELINES)).unwrap_or_default();
-    let (mut at, mut n) = (0, 0);
-    while let Some(head) = bytes.get(at..at + 4) {
-        let size = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
-        let Some(entry) = bytes.get(at + 4..at + 4 + size) else { break };
-        f(n, entry);
-        (at, n) = (at + 4 + size, n + 1);
+/// Visits the complete records in the file's initial length, returning the
+/// end of the last one. A caller can read only the key or skip the payload.
+fn walk_pipelines(
+    dir: &Path,
+    mut f: impl FnMut(usize, usize, &mut dyn Read) -> io::Result<()>,
+) -> u64 {
+    let Ok(file) = std::fs::File::open(dir.join(PIPELINES)) else { return 0 };
+    let Ok(meta) = file.metadata() else { return 0 };
+    let len = meta.len();
+    let mut file = BufReader::new(file);
+    let (mut at, mut n) = (0u64, 0);
+    let mut head = [0u8; 4];
+    while len - at >= 4 && file.read_exact(&mut head).is_ok() {
+        let size = usize::try_from(u32::from_le_bytes(head)).expect("a record length fits usize");
+        let payload = size as u64;
+        if payload > len - at - 4 {
+            break;
+        }
+        let mut entry = (&mut file).take(payload);
+        if f(n, size, &mut entry).is_err() {
+            break;
+        }
+        let unread = entry.limit();
+        if file.seek_relative(unread as i64).is_err() {
+            break;
+        }
+        (at, n) = (at + 4 + payload, n + 1);
     }
-    at as u64
+    at
+}
+
+fn read_pipeline_key(size: usize, entry: &mut dyn Read) -> io::Result<Option<[u8; 16]>> {
+    let mut key = [0; 16];
+    if size < key.len() {
+        return Ok(None);
+    }
+    entry.read_exact(&mut key)?;
+    Ok(Some(key))
 }
 
 /// How many pipelines are known in `dir`.
 pub fn count(dir: &Path) -> usize {
     let mut n = 0;
-    walk_pipelines(dir, |_, _| n += 1);
+    walk_pipelines(dir, |_, _, _| {
+        n += 1;
+        Ok(())
+    });
     n
 }
 
 /// The key of each pipeline known in `dir`, as the early list has it.
 pub fn keys(dir: &Path) -> Vec<String> {
     let mut all = Vec::new();
-    walk_pipelines(dir, |_, e| {
-        all.push(e.get(..16).unwrap_or_default().iter().map(|b| format!("{b:02x}")).collect());
+    walk_pipelines(dir, |_, size, entry| {
+        let key = read_pipeline_key(size, entry)?;
+        all.push(key.iter().flatten().map(|b| format!("{b:02x}")).collect());
+        Ok(())
     });
     all
 }
@@ -273,10 +305,13 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
     let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else { return };
     let wanted: HashSet<usize> = which.iter().copied().collect();
     let mut entries = HashMap::new();
-    walk_pipelines(dir, |n, bytes| {
+    walk_pipelines(dir, |n, size, entry| {
         if wanted.contains(&n) {
-            entries.insert(n, bytes.to_vec());
+            let mut bytes = vec![0; size];
+            entry.read_exact(&mut bytes)?;
+            entries.insert(n, bytes);
         }
+        Ok(())
     });
     let mut read = |hash: &[u8; 32]| {
         let &(_, at, len) = places.get(hash)?;
@@ -558,7 +593,7 @@ mod tests {
         std::fs::write(dir.join(PIPELINES), &bytes[..bytes.len() - 5]).unwrap();
         assert_eq!(count(&dir), 2);
         assert_eq!(keys(&dir)[1], "01".repeat(16));
-        assert_eq!(walk_pipelines(&dir, |_, _| ()), 48);
+        assert_eq!(walk_pipelines(&dir, |_, _, _| Ok(())), 48);
         let mut shader = vec![5u8];
         shader.extend([9; 32]);
         shader.extend(4u32.to_le_bytes());
@@ -570,5 +605,31 @@ mod tests {
         assert_eq!(walk_shaders(&dir, |stage, hash, at, len| seen.push((stage, hash[0], at, len))), one);
         assert_eq!(seen, [(5, 9, 37, 4)]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pipeline_batch_can_skip_other_records_and_keep_their_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let payloads = [vec![7; 32768], vec![0; 8], vec![9; 32]];
+        let mut file = std::fs::File::create(dir.path().join(PIPELINES)).unwrap();
+        for payload in &payloads {
+            file.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
+            file.write_all(payload).unwrap();
+        }
+        let end = file.metadata().unwrap().len();
+        file.write_all(&u32::MAX.to_le_bytes()).unwrap();
+        drop(file);
+
+        let mut wanted = Vec::new();
+        let scanned = walk_pipelines(dir.path(), |n, size, entry| {
+            if n == 2 {
+                assert_eq!(size, payloads[2].len());
+                entry.read_to_end(&mut wanted)?;
+            }
+            Ok(())
+        });
+        assert_eq!(scanned, end);
+        assert_eq!(wanted, payloads[2]);
+        assert_eq!(keys(dir.path()), ["07".repeat(16), String::new(), "09".repeat(16)]);
     }
 }

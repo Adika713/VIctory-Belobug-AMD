@@ -264,11 +264,14 @@ unsafe extern "system" fn compiler_crashed(
 
 /// The thread that deals with the workers the compiler crashed under.
 fn watch() {
-    use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
     loop {
         let event = CRASH_EVENT.load(Ordering::Acquire);
         // SAFETY: the event lives as long as the process.
-        unsafe { WaitForSingleObject(event as windows_sys::Win32::Foundation::HANDLE, INFINITE) };
+        unsafe {
+            use windows_sys::Win32::System::Threading::WaitForSingleObject;
+            WaitForSingleObject(event as windows_sys::Win32::Foundation::HANDLE, 5000);
+        }
         for slot in 0..MAX_SLOTS {
             if CRASHED[slot].swap(false, Ordering::AcqRel) {
                 lost(slot);

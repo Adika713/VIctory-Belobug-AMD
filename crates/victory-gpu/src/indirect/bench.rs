@@ -435,7 +435,11 @@ fn bench_indirect_draw_barriers() {
             submitted += 1;
             queue.Signal(&fence, submitted).unwrap();
             fence.SetEventOnCompletion(submitted, event).unwrap();
-            WaitForSingleObject(event, INFINITE);
+            loop {
+                let r = WaitForSingleObject(event, 5000);
+                if r == windows::Win32::Foundation::WAIT_OBJECT_0 || fence.GetCompletedValue() >= submitted { break; }
+                if device.GetDeviceRemovedReason().is_err() { break; }
+            }
             let ran = running.elapsed().as_secs_f64() * 1e3;
             let mut data = std::ptr::null_mut();
             back.Map(0, None, Some(&mut data)).unwrap();

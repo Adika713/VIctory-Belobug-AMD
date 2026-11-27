@@ -679,7 +679,7 @@ pub(crate) unsafe fn texture(
         // SAFETY: plain creation.
         if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
             crate::residency::allocation_error(&e);
-            tracing::warn!(error = %e, "no block of texture memory");
+            tracing::warn!(error = %e, block_bytes = BLOCK, "no block of texture memory");
         }
         if let Some(h) = &heap
             && let Err(e) = crate::host::resident(device, h).and_then(|()| crate::host::mapped(device))

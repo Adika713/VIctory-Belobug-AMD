@@ -1567,8 +1567,10 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         // opening it and the kernel's write fails the read (and a busy host
         // can refuse one): opened again and tried again, since the title
         // never learns of a failed read.
+        let raw_os = error.raw_os_error();
         tracing::warn!(
             %error,
+            raw_os_error = ?raw_os,
             offset = request.offset,
             size = out.len(),
             done,

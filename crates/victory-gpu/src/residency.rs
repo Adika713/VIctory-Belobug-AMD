@@ -39,7 +39,10 @@ static RETRY_UPLOAD_AT: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn allocation_error(error: &windows::core::Error) {
     if error.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
-        RETRY_UPLOAD_AT.fetch_max(crate::host::coarse_ms().saturating_add(500), Ordering::Relaxed);
+        let now = crate::host::coarse_ms();
+        let commit_mb = sample_commit(now) / MIB;
+        RETRY_UPLOAD_AT.fetch_max(now.saturating_add(500), Ordering::Relaxed);
+        tracing::warn!(error = %error, commit_headroom_mb = commit_mb, "GPU/host allocation returned E_OUTOFMEMORY; pausing texture uploads briefly");
     }
 }
 

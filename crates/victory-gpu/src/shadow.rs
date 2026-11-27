@@ -3513,7 +3513,7 @@ impl Shadow {
             // Sized to each stretch read (`back_piece`): a zeroed 64 KiB per
             // range, most of whose ranges differ nowhere, was most of the
             // work for small ranges.
-            let (mut title, mut mask, mut runs) = (Vec::new(), Vec::new(), Vec::new());
+            let (mut title, mut mask, mut runs, mut was) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
@@ -3525,9 +3525,10 @@ impl Shadow {
                 };
                 // Title memory as read, beside it with the card's bytes put
                 // in: only the dwords that differ are written.
-                let was: Vec<u8> = title.iter().zip(&mask).map(|(now, changed)| now ^ changed).collect();
+                was.clear();
+                was.extend(title[..n].iter().zip(&mask[..n]).map(|(now, changed)| now ^ changed));
                 if !runs.is_empty() {
-                    written += put_changed(start + at + first, &was[..n], &title[..n]);
+                    written += put_changed(start + at + first, &was, &title[..n]);
                 }
             }
             // Our write shows as a title write at the copy's next refresh,

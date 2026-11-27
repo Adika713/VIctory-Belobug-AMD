@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED;
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};

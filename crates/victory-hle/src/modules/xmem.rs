@@ -19,7 +19,7 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
+    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_MAPPED,
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
@@ -494,13 +494,13 @@ impl Drop for Section {
         if let Some(&base) = self.window.get()
             && base != 0
         {
+            lazy_remove(base, self.pages * PAGE);
             // SAFETY: our view; whoever writes through it holds the section.
             unsafe {
                 UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
                     Value: base as *mut c_void,
                 })
             };
-            lazy_remove(base, self.pages * PAGE);
         }
         victory_gpu::title_memory_section_gone(self.handle as usize);
         // SAFETY: our handle; views keep the section alive on their own.
@@ -855,9 +855,9 @@ impl Drop for View {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Memory::UnmapViewOfFile;
         let base = self.at.Value as usize;
+        lazy_remove(base, self.len);
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(self.at) };
-        lazy_remove(base, self.len);
     }
 }
 
@@ -1929,6 +1929,15 @@ fn commit_fault_page(page: usize) -> CommitFault {
     // range (including PAGE_GUARD pages owned by GPU watch) must go through
     // their normal handler.
     if info.State != MEM_RESERVE {
+        // Stale lazy entries on committed pages keep taking the LAZY lock on
+        // unrelated faults; a committed SEC_RESERVE page does not return to
+        // reserve, so dropping the tracking is safe.
+        if info.State == MEM_COMMIT && info.Type == MEM_MAPPED {
+            lazy_remove(page, PAGE);
+        }
+        return CommitFault::NotLazy;
+    }
+    if info.Type != MEM_MAPPED {
         return CommitFault::NotLazy;
     }
     // SAFETY: page is inside a registered reserved mapping view.
@@ -1948,7 +1957,7 @@ pub(crate) fn ensure_lazy_committed(base: usize, len: usize) {
         return;
     }
     let start = base & !(PAGE - 1);
-    let end = base.saturating_add(len);
+    let end = (base.saturating_add(len).saturating_add(PAGE - 1)) & !(PAGE - 1);
     let mut page = start;
     while page < end {
         let range = {
@@ -1966,7 +1975,7 @@ pub(crate) fn ensure_lazy_committed(base: usize, len: usize) {
             }
         };
         let Some((rstart, rend)) = range else { break };
-        let len = rend.saturating_sub(rstart);
+        let len = (rend.saturating_sub(rstart) + PAGE - 1) & !(PAGE - 1);
         // SAFETY: range is inside a registered lazy reserved mapping view.
         let ok = !unsafe { VirtualAlloc(rstart as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null();
         if ok {
@@ -1974,7 +1983,7 @@ pub(crate) fn ensure_lazy_committed(base: usize, len: usize) {
             // Bitmaps in Section are not updated here; later commit/window paths
             // self-heal because VirtualAlloc(MEM_COMMIT) is idempotent.
             lazy_remove(rstart, len);
-            page = rend;
+            page = rstart.saturating_add(len);
         } else {
             // Leave range registered so VEH or a later retry can handle it.
             // Stop scanning to avoid a hot loop on persistent commit failure.
@@ -2960,6 +2969,70 @@ mod tests {
         assert_eq!(ranges.get(&(base + 2 * PAGE)), Some(&(base + len)));
         drop(ranges);
         lazy_remove(base, len);
+    }
+
+    /// A committed read-only page inside a lazy-registered mapped view must not
+    /// be demand-committed RW by the VEH fault helper; GPU watch guards own it.
+    #[test]
+    #[cfg(windows)]
+    fn commit_fault_page_leaves_committed_guarded_page_alone() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MapViewOfFile3, MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION,
+            PAGE_READONLY, PAGE_READWRITE, SEC_COMMIT, UnmapViewOfFile2, VirtualProtect, VirtualQuery,
+        };
+        use windows_sys::Win32::Foundation::CloseHandle;
+
+        let section = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_COMMIT,
+                0,
+                (2 * PAGE) as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null(), "CreateFileMappingW SEC_COMMIT failed");
+
+        let view = unsafe {
+            MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                std::ptr::null(),
+                0,
+                2 * PAGE,
+                0,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert!(!view.Value.is_null(), "MapViewOfFile3 failed");
+        let base = view.Value as usize;
+
+        let registered = register_lazy(base, 2 * PAGE);
+        assert!(registered, "register_lazy failed; VEH not installed");
+
+        let mut old = 0u32;
+        let protected = unsafe { VirtualProtect(base as *const c_void, PAGE, PAGE_READONLY, &mut old) };
+        assert_ne!(protected, 0, "VirtualProtect PAGE_READONLY failed");
+
+        let fault = commit_fault_page(base);
+        assert!(matches!(fault, CommitFault::NotLazy));
+
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let queried = unsafe {
+            VirtualQuery(base as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>())
+        };
+        assert_ne!(queried, 0);
+        assert_eq!(info.State, MEM_COMMIT);
+        assert_eq!(info.Type, MEM_MAPPED);
+        assert_eq!(info.Protect, PAGE_READONLY, "guarded page protection must not be changed");
+
+        lazy_remove(base, 2 * PAGE);
+        let unmapped = unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, 0) };
+        assert_ne!(unmapped, 0);
+        unsafe { CloseHandle(section) };
     }
 
     #[test]

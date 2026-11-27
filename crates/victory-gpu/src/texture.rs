@@ -1245,13 +1245,25 @@ impl Staging {
             }
             last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
-            // big pools is too slow to ask page by page.
-            with_read(size, |read| {
+            // big pools is too slow to ask page by page. Hash before detile:
+            // a spurious or coalesced write-watch notification can mark bytes
+            // written when content is unchanged; digest is cheaper than detile.
+            let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                let hash = digest(read);
+                if last.hash == Some(hash) {
+                    return false;
+                }
+                last.hash = Some(hash);
                 self.detile(read);
+                true
             });
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
+            if changed {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+            }
             return size;
         }
         // View memory has no write-watch, and a texture there was hashed

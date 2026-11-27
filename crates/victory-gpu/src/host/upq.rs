@@ -120,6 +120,21 @@ fn make_slot(device: &ID3D12Device) -> Option<Slot> {
     }
 }
 
+/// Use the smallest idle buffer that fits, leaving larger ones for larger
+/// submissions. If none fits, grow the largest idle buffer.
+fn idle_slot(needed: u64, capacities: impl Iterator<Item = u64>) -> Option<usize> {
+    capacities
+        .enumerate()
+        .min_by_key(|&(_, capacity)| {
+            if capacity >= needed {
+                (false, capacity)
+            } else {
+                (true, needed - capacity)
+            }
+        })
+        .map(|(index, _)| index)
+}
+
 /// One range: the card side, its offset, the CPU side, the bytes.
 pub(super) type Range<'a> = (&'a ID3D12Resource, u64, &'a ID3D12Resource, u64);
 
@@ -149,7 +164,11 @@ pub(super) unsafe fn send(
         STATS[3].fetch_add(1, Relaxed);
         return None;
     };
-    let Some(mut slot) = q.free.pop().or_else(|| make_slot(&host.device)) else {
+    let idle = idle_slot(total, q.free.iter().map(|slot| slot.bounce.as_ref().map_or(0, |b| b.1)));
+    let Some(mut slot) = idle
+        .map(|index| q.free.swap_remove(index))
+        .or_else(|| make_slot(&host.device))
+    else {
         STATS[3].fetch_add(1, Relaxed);
         return None;
     };
@@ -226,5 +245,25 @@ pub(super) fn line(frames: f64) {
              {copies:.0} ranges, {:.1} MB; {before:.1} submissions sent up on the drawing queue (too big, or nothing to send with)",
             bytes / 1048576.0
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::idle_slot;
+
+    #[test]
+    fn the_up_queue_reuses_the_smallest_buffer_that_fits() {
+        let capacities = [64, 32, 16, 0].map(|mb| mb << 20);
+        assert_eq!(idle_slot(48 << 20, capacities.into_iter()), Some(0));
+        assert_eq!(idle_slot(32 << 20, capacities.into_iter()), Some(1));
+        assert_eq!(idle_slot(8 << 20, capacities.into_iter()), Some(2));
+    }
+
+    #[test]
+    fn the_up_queue_grows_the_largest_idle_buffer_when_none_fits() {
+        assert_eq!(idle_slot(64 << 20, [4 << 20, 32 << 20, 16 << 20, 0].into_iter()), Some(1));
+        assert_eq!(idle_slot(64 << 20, [0].into_iter()), Some(0));
+        assert_eq!(idle_slot(64 << 20, [].into_iter()), None);
     }
 }

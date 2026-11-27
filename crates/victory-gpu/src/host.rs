@@ -4210,6 +4210,12 @@ fn hand_back(back: &[Declared]) {
             }
             work.extend(spans.into_iter().map(|(from, to)| (shadow.clone(), from, to)));
         }
+        if work.is_empty() {
+            for (shadow, declared) in back {
+                shadow.copy_back_done(declared);
+            }
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         let scanning = std::time::Instant::now();
         let found = crate::shadow::find_all(&work);

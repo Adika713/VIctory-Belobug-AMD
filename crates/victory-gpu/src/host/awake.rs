@@ -18,7 +18,12 @@ use std::time::Duration;
 
 use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D12::*;
+<<<<<<< HEAD
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+=======
+use windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED;
+use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+>>>>>>> 24d2dbb6 (fix(gpu): handle device removal in the keep-awake fence)
 use windows::core::Interface;
 
 /// About 2 ms at full clocks: 500 sends a second.
@@ -120,6 +125,14 @@ pub(crate) fn start(device: &ID3D12Device, wanted: impl Fn() -> bool + Send + 's
     })
 }
 
+fn fence_backlog(submitted: u64, completed: u64) -> windows::core::Result<u64> {
+    // D3D12 returns UINT64_MAX when the device has been removed.
+    if completed == u64::MAX {
+        return Err(DXGI_ERROR_DEVICE_REMOVED.into());
+    }
+    Ok(submitted.saturating_sub(completed))
+}
+
 fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> windows::core::Result<()> {
     let code = super::compile(COUNT, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
     // SAFETY: plain object creation; the code lives through the calls, the
@@ -177,34 +190,39 @@ fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> w
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
         let mut value = 0u64;
-        let mut result = Ok(());
-        while !stop.load(Ordering::Relaxed) && result.is_ok() {
-            if !wanted() {
-                std::thread::sleep(Duration::from_millis(2));
-                continue;
-            }
-            // Never more than two on the way.
-            if value >= 2 && fence.GetCompletedValue() + 2 <= value {
-                result = fence.SetEventOnCompletion(value - 1, event);
-                if result.is_ok() {
+        let backlog = |value| {
+            fence_backlog(value, fence.GetCompletedValue())
+                .map_err(|removed| device.GetDeviceRemovedReason().err().unwrap_or(removed))
+        };
+        let result = (|| {
+            while !stop.load(Ordering::Relaxed) {
+                if !wanted() {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                // Never more than two on the way.
+                if backlog(value)? >= 2 {
+                    fence.SetEventOnCompletion(value - 1, event)?;
                     WaitForSingleObject(event, 1000);
-                    result = device.GetDeviceRemovedReason();
+                    device.GetDeviceRemovedReason()?;
+                    continue;
                 }
-                continue;
+                queue.ExecuteCommandLists(&lists[(value % 2) as usize..][..1]);
+                value += 1;
+                queue.Signal(&fence, value)?;
             }
-            queue.ExecuteCommandLists(&lists[(value % 2) as usize..][..1]);
-            value += 1;
-            result = queue.Signal(&fence, value);
-        }
-        if result.is_ok() && fence.GetCompletedValue() < value && fence.SetEventOnCompletion(value, event).is_ok() {
-            loop {
-                // SAFETY: event handle valid.
-                let r = WaitForSingleObject(event, 5000);
-                if r == WAIT_OBJECT_0 || fence.GetCompletedValue() >= value {
-                    break;
+            if backlog(value)? > 0 {
+                fence.SetEventOnCompletion(value, event)?;
+                loop {
+                    let r = WaitForSingleObject(event, 5000);
+                    if r.0 == 0 || fence.GetCompletedValue() >= value {
+                        break;
+                    }
+                    device.GetDeviceRemovedReason()?;
                 }
             }
-        }
+            Ok(())
+        })();
         let _ = CloseHandle(event);
         result
     }
@@ -213,6 +231,17 @@ fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> w
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removed_fence_is_not_counted_as_completed() {
+        assert_eq!(fence_backlog(7, 5).unwrap(), 2);
+        assert_eq!(fence_backlog(7, 7).unwrap(), 0);
+        assert_eq!(fence_backlog(u64::MAX - 1, u64::MAX - 2).unwrap(), 1);
+        assert_eq!(
+            fence_backlog(7, u64::MAX).unwrap_err().code(),
+            DXGI_ERROR_DEVICE_REMOVED
+        );
+    }
 
     /// Card memory the CPU maps holds what the CPU wrote, with the card kept
     /// awake meanwhile; the thread ends when it is let go.

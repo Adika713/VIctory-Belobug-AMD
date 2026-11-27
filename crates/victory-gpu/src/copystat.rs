@@ -448,14 +448,14 @@ fn oom_diag(label: &str, size: usize, align: usize) {
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
         use windows::Win32::Storage::FileSystem::WriteFile;
-        let mut buf = [0u8; 256];
+        let mut buf = [0u8; 320];
         let mut i = 0usize;
-        fn push(buf: &mut [u8; 256], i: &mut usize, b: &[u8]) {
+        fn push(buf: &mut [u8; 320], i: &mut usize, b: &[u8]) {
             let n = b.len().min(buf.len().saturating_sub(*i));
             buf[*i..*i + n].copy_from_slice(&b[..n]);
             *i += n;
         }
-        fn push_u(buf: &mut [u8; 256], i: &mut usize, mut v: usize) {
+        fn push_u(buf: &mut [u8; 320], i: &mut usize, mut v: usize) {
             let mut tmp = [0u8; 20];
             let mut n = 0usize;
             if v == 0 {
@@ -477,6 +477,10 @@ fn oom_diag(label: &str, size: usize, align: usize) {
         push_u(&mut buf, &mut i, size);
         push(&mut buf, &mut i, b" align=");
         push_u(&mut buf, &mut i, align);
+        if size >= BIG {
+            push(&mut buf, &mut i, b" big_mb=");
+            push_u(&mut buf, &mut i, size >> 20);
+        }
         push(&mut buf, &mut i, b"\n");
         let handle: HANDLE = GetStdHandle(STD_ERROR_HANDLE).unwrap_or(HANDLE(std::ptr::null_mut()));
         if !handle.is_invalid() {
@@ -486,7 +490,11 @@ fn oom_diag(label: &str, size: usize, align: usize) {
     }
     #[cfg(not(windows))]
     {
-        eprintln!("VICTORY_OOM {label} size={size} align={align}");
+        if size >= BIG {
+            eprintln!("VICTORY_OOM {label} size={size} align={align} big_mb={}", size >> 20);
+        } else {
+            eprintln!("VICTORY_OOM {label} size={size} align={align}");
+        }
     }
 }
 

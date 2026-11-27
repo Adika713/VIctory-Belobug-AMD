@@ -2971,6 +2971,78 @@ mod tests {
         lazy_remove(base, len);
     }
 
+    /// Kernel-write precommit on an unaligned range must commit/remove whole 64K
+    /// lazy pages so a later fault on another offset in the same page is not lost.
+    #[test]
+    #[cfg(windows)]
+    fn ensure_lazy_committed_rounds_unaligned_kernel_write_range() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MapViewOfFile3, MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION,
+            PAGE_READWRITE, SEC_COMMIT, UnmapViewOfFile2, VirtualQuery,
+        };
+        use windows_sys::Win32::Foundation::CloseHandle;
+
+        let section = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_COMMIT,
+                0,
+                (4 * PAGE) as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null(), "CreateFileMappingW SEC_COMMIT failed");
+
+        let view = unsafe {
+            MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                std::ptr::null(),
+                0,
+                4 * PAGE,
+                0,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert!(!view.Value.is_null(), "MapViewOfFile3 failed");
+        let base = view.Value as usize;
+
+        // ensure_lazy_committed is gated by VICTORY_LAZY_PHYSICAL; set for this test.
+        unsafe { std::env::set_var("VICTORY_LAZY_PHYSICAL", "1") };
+        let registered = register_lazy(base, 4 * PAGE);
+        assert!(registered, "register_lazy failed; VEH not installed");
+
+        // Simulate ReadFile(P+0x100, 0x2000): unaligned start/len inside first 64K page.
+        // Regression for adrianmjim review: end must round up to page boundary so the
+        // whole touched 64K page is removed from lazy tracking.
+        ensure_lazy_committed(base + 0x100, 0x2000);
+        unsafe { std::env::remove_var("VICTORY_LAZY_PHYSICAL") };
+
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let queried = unsafe {
+            VirtualQuery(base as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>())
+        };
+        assert_ne!(queried, 0);
+        assert_eq!(info.State, MEM_COMMIT);
+        assert_eq!(info.Type, MEM_MAPPED);
+
+        // The whole 64K page containing the unaligned range should no longer be lazy-tracked.
+        assert!(!lazy_has(base), "lazy tracking should be removed for committed page");
+        assert!(
+            !lazy_has(base + 0x8000),
+            "lazy tracking should be removed for committed page offset"
+        );
+        assert!(lazy_has(base + PAGE), "next page should remain lazy");
+
+        lazy_remove(base, 4 * PAGE);
+        let unmapped = unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, 0) };
+        assert_ne!(unmapped, 0);
+        unsafe { CloseHandle(section) };
+    }
+
     /// A committed read-only page inside a lazy-registered mapped view must not
     /// be demand-committed RW by the VEH fault helper; GPU watch guards own it.
     #[test]

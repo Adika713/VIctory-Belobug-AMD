@@ -316,7 +316,7 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
         a.queue.Signal(&a.fence, a.value)?;
         if a.fence.GetCompletedValue() < a.value {
             a.fence.SetEventOnCompletion(a.value, a.event)?;
-            wait_for_fence_event(a.event, &a.fence, a.value, Some(&device));
+            wait_for_fence_event(a.event, &a.fence, a.value, Some(device));
         }
     }
     let us = started.elapsed().as_micros() as u64;
